@@ -1,0 +1,84 @@
+{
+  "clip": "C:\\Coding\\Projects\\ca\\Esports-Video-clipping-automation\\Original Clips\\Clip5.mp4",
+  "gemini_observation": {
+    "map_guess": "Anubis",
+    "score_t": 0,
+    "score_ct": 0,
+    "round_guess": 1,
+    "events": [
+      {
+        "attacker": "kyxsan",
+        "victim": "zwrlh"
+      },
+      {
+        "attacker": "m0NESY",
+        "victim": "xiELO"
+      }
+    ],
+    "is_highlight": false,
+    "confidence": 0.95,
+    "reason": "Map is identified as Anubis based on the minimap, A site graffiti, and overall environmental art style (e.g., Arabic street signs). Scores are 0-0 and the round is 1 from the top-center HUD. The killfeed in image 6 and 12 clearly shows 'kyxsan' killing 'zwrlh' and 'm0NESY' killing 'xiELO'. No special indicators suggest a highlight play."
+  },
+  "likely_demo": "parivision-vs-falcons-m2-ancient.dem",
+  "likely_round": 19,
+  "match_score": 6.0,
+  "round_analysis": {
+    "round_score": 10.375,
+    "is_round_highlight": false,
+    "kills_total": 8.0,
+    "headshot_ratio": 0.625,
+    "max_multikill_by_player": 3.0
+  },
+  "top_candidates": [
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 19,
+      "match_score": 6.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 21,
+      "match_score": 5.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 2,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 14,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 17,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 22,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 23,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 6,
+      "match_score": 4.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 1,
+      "match_score": 3.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 11,
+      "match_score": 3.0
+    }
+  ]
+}

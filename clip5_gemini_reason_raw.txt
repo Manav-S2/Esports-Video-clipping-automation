@@ -1,0 +1,13 @@
+```json
+{
+  "is_highlight": true,
+  "confidence": 0.8,
+  "why_highlight": [
+    "The round starts with two immediate headshot kills with pistols, demonstrating mechanical skill and fast reaction plays right from the start.",
+    "The casters explicitly mention the impact of these pistol headshots and how they forced the CTs into unfavorable positions, indicating strong strategic play and team coordination from Falcons.",
+    "The description of 'perfect start' and punishing mistakes aligns with highlight-worthy moments where a team capitalizes on opponent errors."
+  ],
+  "why_not_highlight": [],
+  "final_reason": "The round is classified as a highlight due to the immediate and decisive pistol headshots, demonstrating excellent mechanical skill and strategic execution by Falcons, which set a strong tone for the match."
+}
+```
