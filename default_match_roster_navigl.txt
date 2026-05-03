@@ -1,0 +1,24 @@
+Default session roster (edit live_pipeline_config.json to point elsewhere).
+VOD: https://www.twitch.tv/videos/2760697668 — jump ~10:08:25 (H:MM:SS from broadcast start).
+
+Maps: Mirage, Ancient (all maps segment).
+
+--- Teams / players (caption spellings) ---
+
+Natus Vincere (NAVI), Ukraine org:
+- Ihor 'w0nderful' Zhdanov — Ukraine
+- Drin 'makazze' Shaqiri — Kosovo
+- Valeriy 'b1t' Vakhovskiy — Ukraine
+- Aleksi 'Aleksib' Virolainen — Finland
+- Mihai 'iM' Ivan — Romania
+
+GamerLegion:
+- Fredrik 'REZ' Sterner — Sweden
+- Sebastian 'Tauson' Tauson Lindelof — Denmark
+- Oldřich 'PR' Nový — Czech Republic
+- Milan 'hypex' Polowiec — Poland
+- Janusz 'Snax' Pogorzelski — Poland
+
+--- Broadcast stats snapshot (reference only) ---
+NAVI: w0nderful 46-20 ADR 106.8 rating 1.97 | makazze 40-26 | b1t 25-25 | Aleksib 23-20 | iM 23-26
+GamerLegion: REZ 30-30 | Tauson 29-30 | PR 22-34 | hypex 18-30 | Snax 18-33

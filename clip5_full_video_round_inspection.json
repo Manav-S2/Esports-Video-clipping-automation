@@ -1,0 +1,102 @@
+{
+  "clip": "C:\\Coding\\Projects\\ca\\Esports-Video-clipping-automation\\Original Clips\\Clip5.mp4",
+  "analysis_mode": "full_video_upload",
+  "gemini_observation": {
+    "map_guess": "Mirage",
+    "score_t": 0,
+    "score_ct": 0,
+    "round_guess": 1,
+    "events": [
+      {
+        "attacker": "Kyousuke",
+        "victim": "zweih",
+        "weapon": "P250"
+      },
+      {
+        "attacker": "mONESY",
+        "victim": "xIELO",
+        "weapon": "P250"
+      },
+      {
+        "attacker": "Kyousuke",
+        "victim": "nota",
+        "weapon": "P250"
+      },
+      {
+        "attacker": "mONESY",
+        "victim": "Jame",
+        "weapon": "P250"
+      },
+      {
+        "attacker": "Kyousuke",
+        "victim": "DELCHROMXX",
+        "weapon": "P250"
+      }
+    ],
+    "is_highlight": true,
+    "confidence": 5,
+    "reason": "The clip shows a fast and decisive pistol round win by Team Falcons (Ts) with a 5-kill streak. The score is 0-0 in Round 1 on Mirage, and the kill feed clearly displays all kills made by Kyousuke and mONESY using P250s, leading to a perfect round win. This is explicitly described as a 'perfect start' and a 'good round' by the commentators."
+  },
+  "likely_demo": "parivision-vs-falcons-m1-mirage.dem",
+  "likely_round": 20,
+  "match_score": 15.0,
+  "round_analysis": {
+    "round_score": 11.64,
+    "is_round_highlight": false,
+    "kills_total": 5.0,
+    "headshot_ratio": 0.2,
+    "max_multikill_by_player": 3.0
+  },
+  "top_candidates": [
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 20,
+      "match_score": 15.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 8,
+      "match_score": 14.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 15,
+      "match_score": 14.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 7,
+      "match_score": 13.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 16,
+      "match_score": 12.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 17,
+      "match_score": 12.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 20,
+      "match_score": 12.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 21,
+      "match_score": 11.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m2-ancient.dem",
+      "round": 2,
+      "match_score": 11.0
+    },
+    {
+      "demo": "parivision-vs-falcons-m1-mirage.dem",
+      "round": 4,
+      "match_score": 10.0
+    }
+  ]
+}

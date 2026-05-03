@@ -1,0 +1,42 @@
+.venv/
+.venv-win314/
+__pycache__/
+*.pyc
+.env
+speech_api_key.local.json
+aws_credentials.local.json
+node_modules/
+dist/
+build/
+
+# Local credentials / secrets — copy from *.example.json / env vars instead.
+live_pipeline_config.json
+
+# Generated pipeline runs (often multi‑GB).
+live_pipeline_output/
+
+# Portable toolchain downloads (large binaries).
+streamlink_portable/
+streamlink*.zip
+
+# Misc local artifacts
+_pip_install_log.txt
+Teams/
+Videos - Shortcut.lnk
+
+# Raw editorial clips (often > GitHub's 100 MB limit — keep locally or use Git LFS).
+Original Clips/
+
+# Demo assets: typically exceed GitHub's 100 MB limit — use Git LFS or host separately.
+blast-open-*/
+
+# Cached frame experiments (often huge)
+killfeed_frames*/
+killfeed_frames_direct*/
+killfeed_snapshots*/
+ocr8k_*/
+every_second_*/
+8k frames per second plus numpy panda/
+Cropped kill feed/
+Frames per second/
+Optimized video 8k 1sec frames/

@@ -1,0 +1,35 @@
+{
+  "input_path": "C:\\Coding\\Projects\\ca\\Esports-Video-clipping-automation\\blast-open-rotterdam-2026-parivision-vs-falcons-bo3-jB8BGzhBMGFhbYcN6o5bu2",
+  "demos_analyzed": [
+    "C:\\Coding\\Projects\\ca\\Esports-Video-clipping-automation\\blast-open-rotterdam-2026-parivision-vs-falcons-bo3-jB8BGzhBMGFhbYcN6o5bu2\\parivision-vs-falcons-m1-mirage.dem",
+    "C:\\Coding\\Projects\\ca\\Esports-Video-clipping-automation\\blast-open-rotterdam-2026-parivision-vs-falcons-bo3-jB8BGzhBMGFhbYcN6o5bu2\\parivision-vs-falcons-m2-ancient.dem"
+  ],
+  "score": 17.078,
+  "is_highlight": true,
+  "confidence": 1.0,
+  "demo_score": 17.078,
+  "vision_score": null,
+  "features": {
+    "kills_total": 155.0,
+    "kills_per_minute": 2.817,
+    "headshot_ratio": 0.535,
+    "multi_kill_burst_score": 18.3,
+    "unique_killers": 10.5
+  },
+  "vision": {
+    "vision_score": 0.0,
+    "confidence": 0.0,
+    "action_intensity": 0.0,
+    "combat_presence": 0.0,
+    "clutch_or_multikill_cues": 0.0,
+    "broadcast_hype_cues": 0.0
+  },
+  "notes": [
+    "Classified as highlight candidate.",
+    "parivision-vs-falcons-m1-mirage.dem: Used tick/64 fallback for event timing.",
+    "parivision-vs-falcons-m2-ancient.dem: Used tick/64 fallback for event timing.",
+    "Demo score uses max map score to capture peak highlight moments.",
+    "Video provided but GEMINI_API_KEY was not set, so vision scoring was skipped.",
+    "Used demo score only (vision score unavailable)."
+  ]
+}

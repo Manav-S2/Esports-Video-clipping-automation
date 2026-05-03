@@ -1,0 +1,38 @@
+{\\rtf1\\ansi\\deff0 {\\fonttbl {\\f0 Calibri;}}\\f0\\fs22 Video Editing Handoff Summary\\par
+\\par
+What user wanted\\par
+- Short-form style edit matching reference screenshot.\\par
+- Portrait output.\\par
+- Blurred strips/background style.\\par
+- Captions skipped for now (user will source captions externally).\\par
+\\par
+What was implemented\\par
+- Added reusable script: riverside_vertical_caption_edit.ps1\\par
+- Script supports:\\par
+  - Vertical 9:16 canvas\\par
+  - Blurred background/strip effect with centered gameplay\\par
+  - Optional captions (captions file not required)\\par
+  - H.264, CRF 14, preset slow, yuv420p, +faststart\\par
+\\par
+Key output files created\\par
+- Clip1.vertical.blur-stripes.mp4\\par
+- Clip1.vertical.blur-stripes.portrait.mp4\\par
+\\par
+Final verified technical state\\par
+- Final portrait file is 1080x1920\\par
+- SAR 1:1\\par
+- DAR 9:16\\par
+- Rotation metadata normalized\\par
+\\par
+Issues encountered and fixes\\par
+- FFmpeg filter graph scale expression parsing issue\\par
+- Unconnected filter output when captions omitted\\par
+- Fixed by using split + blurred background + centered foreground overlay and explicit output label mapping\\par
+\\par
+Captured user preferences from this chat\\par
+- Kill-feed deliverable should default to upper-right quarter cropped video, not CSV OCR output (unless explicitly requested)\\par
+- Editing phase preference: blur-stripes portrait output; captions to be handled externally\\par
+\\par
+Current status\\par
+- No-caption portrait edit completed\\par
+- Next step (optional): burn in captions later when caption file is provided }
