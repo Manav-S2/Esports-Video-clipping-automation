@@ -1,0 +1,66 @@
+# Local credentials: copy live_pipeline_config.example.json → live_pipeline_config.json
+# and aws_credentials.local.example.json → aws_credentials.local.json before running.
+#
+# Twitch / YouTube in Docker (Windows):
+#   - "Failed to resolve stream URL via streamlink" often means DNS or outbound HTTPS from the container
+#     (datacenter IPs may be blocked by the site, or Docker Desktop / WSL networking is flaky).
+#   - Lines like "WSL ERROR: UtilBindVsockAnyPort" come from Docker Desktop’s WSL2 backend, not Python.
+#     Restart Docker Desktop or update it if that spam appears.
+#   - Easiest fix for live capture: run the pipeline on the Windows host (.\run_live_pipeline.ps1), not in Docker.
+#
+# BuildKit (optional): $env:DOCKER_BUILDKIT='1' before docker compose build
+# Streamlink debug in container: $env:STREAMLINK_LOGLEVEL='debug'
+#
+# docker compose build
+# docker compose run --rm pipeline
+# Shell (image ENTRYPOINT is python — do not ``run pipeline bash`` without overriding entrypoint):
+#   docker compose run --rm pipeline-shell
+#   docker compose run --rm --entrypoint bash pipeline
+# Interactive: docker compose run --rm pipeline live_stream_highlight_pipeline.py --config live_pipeline_config.json --interactive
+# Debug streamlink (``pipeline`` uses python entrypoint — use ``streamlink-debug`` or ``--entrypoint streamlink``):
+#   docker compose run --rm streamlink-debug --stream-url "https://www.twitch.tv/videos/..." best
+#   docker compose run --rm --entrypoint streamlink pipeline --stream-url "https://www.twitch.tv/videos/..." best
+
+x-pipeline-common: &pipeline-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: esports-video-clipping:latest
+  working_dir: /app
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+  # Mount the whole repo so ignored secrets/output on the host are still visible inside the container.
+  volumes:
+    - .:/app
+  environment:
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+    GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    VERTEX_API_KEY: ${VERTEX_API_KEY:-}
+    VERTEX_PROJECT_ID: ${VERTEX_PROJECT_ID:-}
+    GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+    GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+    SSL_CERT_FILE: ${SSL_CERT_FILE:-}
+    STREAMLINK_LOGLEVEL: ${STREAMLINK_LOGLEVEL:-info}
+  stdin_open: true
+  tty: true
+
+services:
+  pipeline:
+    <<: *pipeline-common
+    entrypoint: ["python", "-u"]
+    command: ["live_stream_highlight_pipeline.py", "--config", "live_pipeline_config.json"]
+
+  pipeline-shell:
+    <<: *pipeline-common
+    entrypoint: ["/bin/bash"]
+
+  # Smoke-test Twitch/VOD resolution without Python entrypoint (see header comments).
+  streamlink-debug:
+    <<: *pipeline-common
+    entrypoint: ["streamlink"]
+    command: ["--version"]

@@ -7,6 +7,6 @@ demoparser2>=0.38.0
 google-generativeai>=0.8.5
 google-genai>=1.14.0
 instagrapi>=2.1.3
-streamlink
+streamlink>=8.3.0
 google-cloud-speech>=2.26.0
 openai-whisper>=20231117
