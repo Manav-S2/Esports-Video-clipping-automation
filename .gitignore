@@ -9,6 +9,9 @@ node_modules/
 dist/
 build/
 
+# Docker image export for VMs (`docker save -o esports-video-clipping_latest.tar …`).
+esports-video-clipping_latest.tar
+
 # Local credentials / secrets — copy from *.example.json / env vars instead.
 live_pipeline_config.json
 
@@ -22,7 +25,7 @@ streamlink*.zip
 # Misc local artifacts
 _pip_install_log.txt
 Teams/
-Videos - Shortcut.lnk
+Videos - Shortcut*.lnk
 
 # Raw editorial clips (often > GitHub's 100 MB limit — keep locally or use Git LFS).
 Original Clips/

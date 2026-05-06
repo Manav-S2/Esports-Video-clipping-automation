@@ -24,7 +24,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import warnings
@@ -48,6 +48,42 @@ from video_editor import apply_portrait_blur
 # Strict live HUD cadence: wall-clock period between successive crop → AI round checks.
 # ``PipelineConfig.screenshot_interval_sec`` is not used for this loop (kept for compatibility / timeouts).
 LIVE_HUD_ROUND_CHECK_INTERVAL_SEC = 5.0
+
+# Vertex highlight analysis: **9** equipart snapshots + clip audio for Gemini multimodal scoring.
+HIGHLIGHT_ANALYSIS_FRAME_COUNT = 9
+HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC = 900  # cap audio excerpt length for inline Vertex payload (~size-safe at 48kbps mono).
+
+HIGHLIGHT_RULES_CONTEXT_MAX_CHARS = 8000
+
+# Default highlight-rules Word document: ``…\Esports-Video-clipping-automation\CS2_Highlights.docx``
+# (same folder as this module). Used when JSON ``rules_docx`` is missing or blank.
+DEFAULT_HIGHLIGHT_RULES_DOCX = Path(__file__).resolve().parent / "CS2_Highlights.docx"
+
+# Injected into the Vertex highlight prompt: how to weigh speech, prosody, and weak phrases vs. multi-signal fusion.
+HIGHLIGHT_VERTEX_AUDIO_ANALYSIS_GUIDE = """
+Audio + multimodal highlight scoring (listen to the attached clip audio; infer meaning and intensity — do not raw keyword-match):
+
+Signal families (examples, not exhaustive):
+1) Direct hype / excitement (very high weight): e.g. OH MY GOD, NO WAY, WHAT WAS THAT, ARE YOU SERIOUS, INSANE, CRAZY,
+   WHAT THE HELL, BROOOOO, CLIP THAT, THAT'S A CLIP, SEND THAT, HIGHLIGHT RIGHT THERE.
+2) Kill streak / clutch (high weight; combine with visuals): 1v2/1v3/1v4/1v5, CLUTCH, ACE, QUAD KILL,
+   HE GOT ALL OF THEM, NO WAY HE WINS THIS, HE WINS THESE, HE'S HIM, LAST GUY, ONE MORE.
+3) Skill / mechanics: ONE TAP, HEADSHOT, FLICK, INSANE FLICK, WHAT A SHOT, PIXEL, PRE-FIRE, SPRAYDOWN, TRACKING, CLEAN.
+4) Big brain / surprise: OUTPLAYED, HE READ HIM, WHAT A PLAY, 200 IQ, BIG BRAIN, FAKE, BAITED, MIND GAMES.
+5) Commentary-style: UNBELIEVABLE, ABSOLUTELY RIDICULOUS, YOU CAN'T WRITE THIS, THIS IS NOT REAL, HE'S DONE IT, WHAT A MOMENT.
+6) Non-verbal audio (strong ML-style cues): sudden volume spike, screaming, laughter bursts, sharp pitch rise — especially if
+   clustered with exciting visuals.
+7) Chat / overlay if heard: CLIP, CLIP IT, WTF, HOLY, OMG, INSANE spam — useful mainly when combined with other signals.
+8) Weak alone (avoid false positives): generic "nice", "good shot", "okay", "lol" — not highlight-worthy without stronger evidence.
+
+Fusion rule: The best highlights are multi-signal in a short window. Example: hype phrase + visible multi-kill/clutch + loud reaction
+→ high confidence. Example: only "nice shot" + routine single kill → is_highlight=false.
+
+Visuals: You also get one JPEG contact sheet with exactly 9 thumbnails, evenly spaced in time across the full clip duration
+(left-to-right, top-to-bottom, chronological). Use audio and visuals together; require multi-signal or clearly explosive moments —
+do not mark highlights on generic praise or noise alone.
+""".strip()
+
 # Avoid calling streamlink on every HUD grab; tokens usually last long enough; retry with refresh on failure.
 STREAMLINK_RESOLVE_CACHE_SEC = 75.0
 # Fail fast if the HLS read stalls (microseconds for ffmpeg ``-rw_timeout``).
@@ -165,6 +201,36 @@ def _extract_docx_text(docx_path: Path) -> str:
     return xml.strip()
 
 
+def _resolve_rules_docx_path(rules_raw: str, pipeline_config_path: Path) -> Path:
+    """Resolve ``rules_docx`` for config + host OS.
+
+    Windows-style absolute paths (``C:\\...``) are not POSIX-absolute, so Docker/Linux used to join
+    them with ``/app`` and break. On non-Windows we map those to ``<config_dir>/<basename>`` (bind-mounted repo).
+    """
+    s = (rules_raw or "").strip()
+    if not s:
+        raise ValueError("rules_docx value is empty")
+
+    cfg_parent = pipeline_config_path.resolve().parent
+    candidate = Path(s)
+
+    if PureWindowsPath(s).is_absolute():
+        if sys.platform == "win32":
+            return candidate.resolve()
+        fallback = (cfg_parent / candidate.name).resolve()
+        print(
+            f"[live] rules_docx is a Windows absolute path; in this OS it is not usable as-is — "
+            f"trying bind-mounted path: {fallback}",
+            flush=True,
+        )
+        return fallback
+
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    return (cfg_parent / candidate).resolve()
+
+
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -178,6 +244,95 @@ def _run_ffmpeg(cmd: List[str]) -> None:
             f"stdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}"
         )
+
+
+def _resolve_ffprobe_bin(ffmpeg_bin: Optional[str]) -> Optional[str]:
+    """Locate ``ffprobe`` on PATH or next to ``ffmpeg`` (Windows-friendly)."""
+    w = shutil.which("ffprobe")
+    if w:
+        return w
+    if ffmpeg_bin:
+        parent = Path(ffmpeg_bin).resolve().parent
+        for name in ("ffprobe.exe", "ffprobe"):
+            cand = parent / name
+            if cand.is_file():
+                return str(cand)
+    return None
+
+
+def _ffprobe_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+    """Return container duration in seconds, or None if unknown."""
+    exe = _resolve_ffprobe_bin(ffmpeg_bin)
+    if not exe:
+        return None
+    cmd = [
+        exe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            return None
+        line = (proc.stdout or "").strip().splitlines()
+        if not line:
+            return None
+        val = float(line[0])
+        if val <= 0 or val != val:  # NaN check
+            return None
+        return val
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _ffmpeg_demuxer_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+    """Parse ``Duration:`` from ``ffmpeg -i`` stderr (header read only; no full decode)."""
+    if not ffmpeg_bin:
+        return None
+    cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(media_path)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    blob = (proc.stderr or "") + (proc.stdout or "")
+    m = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2})\.(\d+)", blob)
+    if not m:
+        return None
+    h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    frac = m.group(4)
+    try:
+        sub = int(frac) / (10 ** len(frac))
+    except ValueError:
+        return None
+    val = h * 3600 + mn * 60 + s + sub
+    return val if val > 0 else None
+
+
+def _clip_duration_for_analysis(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+    d = _ffprobe_duration_sec(media_path, ffmpeg_bin)
+    if d is not None:
+        return d
+    return _ffmpeg_demuxer_duration_sec(media_path, ffmpeg_bin)
+
+
+def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> List[float]:
+    """Timestamps at the center of ``divisions`` equal slices (full timeline coverage)."""
+    dur = float(duration_sec)
+    k = max(1, int(divisions))
+    if dur <= 0:
+        return [0.0] * k
+    margin = max(0.25, min(dur * 0.02, 8.0))
+    lo = margin
+    hi = dur - margin
+    if hi <= lo:
+        lo, hi = 0.0, dur
+    usable = hi - lo
+    return [lo + usable * (i + 0.5) / k for i in range(k)]
 
 
 def _ensure_dir(path: Path) -> None:
@@ -463,6 +618,7 @@ def _vertex_generate_content(
     prompt: str,
     image_path: Optional[Path] = None,
     *,
+    audio_path: Optional[Path] = None,
     max_output_tokens: int = 1024,
 ) -> str:
     """Gemini on Vertex AI via REST + API key (see Vertex AI Express Mode / API key auth)."""
@@ -490,6 +646,22 @@ def _vertex_generate_content(
                 }
             }
         )
+    if audio_path is not None:
+        audio_bytes = audio_path.read_bytes()
+        audio_mime = mimetypes.guess_type(audio_path.name)[0] or "audio/mpeg"
+        print(
+            f"[live] Vertex generateContent (highlight): attaching audio inline "
+            f"{audio_path.name} {len(audio_bytes) / 1024:.1f} KiB mime={audio_mime}",
+            flush=True,
+        )
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": audio_mime,
+                    "data": base64.b64encode(audio_bytes).decode("ascii"),
+                }
+            }
+        )
 
     payload: Dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
@@ -502,8 +674,12 @@ def _vertex_generate_content(
     ssl_ctx = ssl._create_unverified_context()
     transient_http = frozenset({429, 500, 502, 503, 504})
     max_attempts = 8
-    # Multimodal requests (large inline image) often exceed default ~120s server-side latency.
-    read_timeout_sec = 120.0 if image_path is not None else 180.0
+    # Multimodal requests (large inline image and/or audio) often exceed ~120s server-side latency.
+    read_timeout_sec = 180.0
+    if image_path is not None:
+        read_timeout_sec = max(read_timeout_sec, 240.0)
+    if audio_path is not None:
+        read_timeout_sec = max(read_timeout_sec, 360.0)
     raw = ""
     for attempt in range(max_attempts):
         req = urllib.request.Request(
@@ -695,14 +871,24 @@ def _prompt_live_or_recorded() -> str:
         print("[live] Type 1 for live or 2 for recorded/VOD.", flush=True)
 
 
-def _read_multiline_match_context(end_sentinel: str = "END") -> str:
+def _read_interactive_match_context(end_sentinel: str = "END") -> str:
+    """Multiline paste (LIVE or VOD): team/player/caster notes → Gemini 2.5 Flash roster extract.
+
+    Type ``SKIP`` alone on the first line to skip when you have no roster notes (optional).
+    """
     print("", flush=True)
     print(
-        "[live] Paste match context: teams, players, casters, maps - anything useful for captions.",
+        "[live] Match context (optional): team names, player nicknames / in-game names, alternate spellings,",
         flush=True,
     )
     print(
-        f"[live] When finished, type {end_sentinel} on its own line and press Enter.",
+        "[live]   caster names — anything useful for captions. "
+        "Gemini 2.5 Flash runs first (then Vertex if needed) to build the roster file.",
+        flush=True,
+    )
+    print(
+        f"[live] No notes? Type SKIP alone on the first line. "
+        f"Otherwise paste notes, then type {end_sentinel} on its own line and press Enter.",
         flush=True,
     )
     lines: List[str] = []
@@ -713,6 +899,8 @@ def _read_multiline_match_context(end_sentinel: str = "END") -> str:
             break
         if line.strip() == end_sentinel:
             break
+        if not lines and line.strip().upper() == "SKIP":
+            return ""
         lines.append(line)
     return "\n".join(lines).strip()
 
@@ -720,13 +908,23 @@ def _read_multiline_match_context(end_sentinel: str = "END") -> str:
 def _normalize_match_context_for_captions(
     cfg: PipelineConfig,
     raw_notes: str,
+    *,
+    prefer_gemini_api: bool = False,
+    gemini_model_override: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """Expand informal notes into roster text (+ structured extract) via Gemini or Vertex."""
     if not raw_notes.strip():
         return "", {}
 
+    focus = ""
+    if prefer_gemini_api:
+        focus = (
+            "Prioritize accurate team names and player rosters (handles, nicknames, common caster spellings).\n\n"
+        )
+
     prompt = (
         "You extract structured esports match context from informal notes for speech-to-text captioning.\n\n"
+        f"{focus}"
         "USER NOTES:\n"
         f"{raw_notes}\n\n"
         "Return STRICT JSON only:\n"
@@ -744,8 +942,43 @@ def _normalize_match_context_for_captions(
 
     raw_response = ""
     last_api_err: Optional[BaseException] = None
+    model_g = (gemini_model_override or cfg.gemini_model or "gemini-2.5-flash").strip()
 
-    if cfg.vertex_project_id and cfg.vertex_api_keys:
+    if prefer_gemini_api:
+        keys_gem = list(dict.fromkeys(k for k in (cfg.gemini_api_keys or []) if (k or "").strip()))
+        for key in keys_gem:
+            if (raw_response or "").strip():
+                break
+            try:
+                raw_response = _gemini_generate_text(
+                    key,
+                    model_g,
+                    prompt,
+                    None,
+                    max_output_tokens=4096,
+                )
+            except Exception as exc:
+                last_api_err = exc
+                print(f"[live] Gemini roster ({model_g}) failed: {exc}", flush=True)
+        if not (raw_response or "").strip() and cfg.vertex_project_id and cfg.vertex_api_keys:
+            try:
+                raw_response = _vertex_generate_content(
+                    cfg.vertex_api_keys[0],
+                    cfg.vertex_project_id,
+                    cfg.vertex_location,
+                    (cfg.gemini_model or model_g).strip(),
+                    prompt,
+                    None,
+                    max_output_tokens=4096,
+                )
+            except RuntimeError as exc:
+                last_api_err = exc
+                print(
+                    "[live] Vertex roster fallback failed (often DNS/offline).",
+                    flush=True,
+                )
+
+    elif cfg.vertex_project_id and cfg.vertex_api_keys:
         try:
             raw_response = _vertex_generate_content(
                 cfg.vertex_api_keys[0],
@@ -764,7 +997,20 @@ def _normalize_match_context_for_captions(
                 flush=True,
             )
 
-    if not (raw_response or "").strip() and cfg.gemini_api_keys:
+        if not (raw_response or "").strip() and cfg.gemini_api_keys:
+            try:
+                raw_response = _gemini_generate_text(
+                    cfg.gemini_api_keys[0],
+                    cfg.gemini_model,
+                    prompt,
+                    None,
+                    max_output_tokens=4096,
+                )
+            except Exception as exc:
+                last_api_err = exc
+                print(f"[live] Gemini roster call failed ({exc}); using your pasted text as-is.", flush=True)
+
+    elif cfg.gemini_api_keys:
         try:
             raw_response = _gemini_generate_text(
                 cfg.gemini_api_keys[0],
@@ -812,12 +1058,58 @@ def _normalize_match_context_for_captions(
     return combined, structured
 
 
-def _interactive_session_configure(cfg: PipelineConfig) -> PipelineConfig:
-    """Opt-in via ``--interactive``: prompts for URL, VOD seek, roster paste; writes karaoke_vertex roster."""
+def _url_looks_like_twitch_vod(url: str) -> bool:
+    """True for Twitch archive URLs ``.../videos/<id>`` (not a channel root page)."""
+    return "twitch.tv/videos/" in (url or "").lower()
+
+
+def _interactive_session_configure(cfg: PipelineConfig, *, stream_url_from_cli: bool = False) -> PipelineConfig:
+    """Opt-in via ``--interactive``: LIVE vs VOD, URL, VOD timestamp if needed, optional match context.
+
+    ``stream_url_from_cli``: ``True`` only when ``--stream-url`` was passed with a non-empty URL —
+    URL prompts are skipped (same URL used for LIVE or VOD).
+
+    Without CLI URL: **LIVE** always prompts for a URL — JSON ``stream_url`` is **not** reused (avoids
+    analyzing a saved Blast VOD while choosing LIVE). **VOD** accepts Enter to keep JSON default.
+
+    Context is optional: user may type ``SKIP`` on the first line. Roster file is still written
+    (minimal placeholder when skipped). Gemini runs only when non-empty notes are pasted.
+    """
     mode = _prompt_live_or_recorded()
-    url = _input_nonempty("[live] Paste stream / VOD link: ")
+    preset_url = (cfg.stream_url or "").strip()
+
+    if mode == "live":
+        if stream_url_from_cli and preset_url:
+            url = preset_url
+            print(f"[live] Stream URL (--stream-url): {url}", flush=True)
+        else:
+            if preset_url:
+                print(
+                    "[live] Config contains stream_url (often a saved VOD). "
+                    "For LIVE it is ignored until you paste a **live channel** URL.",
+                    flush=True,
+                )
+            url = _input_nonempty("[live] LIVE URL (e.g. https://www.twitch.tv/channelname): ")
+    else:
+        if stream_url_from_cli and preset_url:
+            url = preset_url
+            print(f"[live] Stream URL (--stream-url): {url}", flush=True)
+        elif preset_url:
+            typed = input("[live] VOD URL [Enter = use stream_url from config]: ").strip()
+            url = typed if typed else preset_url
+            print(f"[live] Stream URL: {url}", flush=True)
+        else:
+            url = _input_nonempty("[live] Paste VOD link: ")
+
     if not url:
         raise RuntimeError("Empty stream URL.")
+
+    if mode == "live" and _url_looks_like_twitch_vod(url):
+        print(
+            "[live] WARN: URL looks like a Twitch **past broadcast** (/videos/…). "
+            "Use https://www.twitch.tv/<channel> while they are live.",
+            flush=True,
+        )
 
     seek_sec = 0.0
     if mode == "vod":
@@ -825,10 +1117,6 @@ def _interactive_session_configure(cfg: PipelineConfig) -> PipelineConfig:
             "[live] VOD start offset from beginning (seconds, MM:SS, H:MM:SS; blank = 0): ",
         ).strip()
         seek_sec = _parse_seek_seconds(ts_raw if ts_raw else "0")
-
-    raw_ctx = _read_multiline_match_context()
-    if not raw_ctx.strip():
-        print("[live] No match context pasted; roster file will be minimal.", flush=True)
 
     root = Path(cfg.output_root).resolve()
     meta = root / "meta"
@@ -838,13 +1126,26 @@ def _interactive_session_configure(cfg: PipelineConfig) -> PipelineConfig:
 
     structured_summary: Dict[str, Any] = {}
     roster_blob = ""
+    raw_ctx = _read_interactive_match_context()
+    if not raw_ctx.strip():
+        print("[live] Match context skipped or empty; roster file will be minimal.", flush=True)
     if raw_ctx.strip():
-        print("[live] Calling Gemini/Vertex to extract teams & players from your notes...", flush=True)
-        roster_blob, structured_summary = _normalize_match_context_for_captions(cfg, raw_ctx)
+        print(
+            "[live] Calling Gemini 2.5 Flash (then Vertex fallback if needed) to extract teams & players...",
+            flush=True,
+        )
+        roster_blob, structured_summary = _normalize_match_context_for_captions(
+            cfg,
+            raw_ctx,
+            prefer_gemini_api=True,
+            gemini_model_override="gemini-2.5-flash",
+        )
     if not roster_blob.strip():
         roster_blob = "(no roster context provided)\n"
 
     roster_path.write_text(roster_blob, encoding="utf-8")
+    roster_out = roster_path.resolve()
+
     session_log.write_text(
         json.dumps(
             {
@@ -852,16 +1153,25 @@ def _interactive_session_configure(cfg: PipelineConfig) -> PipelineConfig:
                 "stream_mode": mode,
                 "stream_url": url,
                 "stream_input_seek_sec": seek_sec,
-                "roster_path": str(roster_path.resolve()),
+                "roster_path": str(roster_out),
                 "structured_extract_keys": list(structured_summary.keys()),
                 "user_notes_chars": len(raw_ctx),
+                "roster_context_skipped": not bool(raw_ctx.strip()),
+                "roster_extract_pipeline": "gemini-2.5-flash-then-vertex"
+                if raw_ctx.strip()
+                else "skipped",
             },
             indent=2,
         ),
         encoding="utf-8",
     )
 
-    print(f"[live] Session roster written: {roster_path}", flush=True)
+    print(f"[live] Session roster: {roster_out}", flush=True)
+    print(
+        f"[live] Recording arms after HUD detects the same round {cfg.stable_round_reads_to_start} time(s) "
+        "(JSON ``stable_round_reads_to_start``); ensure the stream shows in-game HUD.",
+        flush=True,
+    )
     print("[live] Interactive setup complete; starting round detection.", flush=True)
 
     return replace(
@@ -869,7 +1179,7 @@ def _interactive_session_configure(cfg: PipelineConfig) -> PipelineConfig:
         stream_url=url,
         stream_input_seek_sec=float(max(0.0, seek_sec)),
         caption_provider="karaoke_vertex",
-        karaoke_vertex_roster_path=str(roster_path.resolve()),
+        karaoke_vertex_roster_path=str(roster_out),
     )
 
 
@@ -1127,9 +1437,9 @@ class PipelineConfig:
     stream_url: str
     # HUD round scores: always AWS Rekognition DetectText (loader forces ``rekognition``).
     api_provider: str
-    # Post-round highlights / titles: nvidia | gemini | vertex (not Rekognition).
+    # Post-round highlight scoring (contact sheet → multimodal): **Vertex AI Gemini only** (loader forces ``vertex``).
     highlight_api_provider: str
-    # Background threads draining ``_highlight_queue`` (contact-sheet Vertex/Gemini/NVIDIA work).
+    # Background threads draining ``_highlight_queue`` (Vertex contact-sheet work).
     highlight_parallel_workers: int
     # When True, highlight multimodal waits whenever HUD Rekognition/HTTP holds ``_hud_remote_calls_active``.
     highlight_yield_to_hud_vision: bool
@@ -1145,6 +1455,7 @@ class PipelineConfig:
     aws_secret_access_key: str
     aws_session_token: str
     demo_file: str
+    # JSON key ``rules_docx``: path (relative to this JSON file, or absolute) to highlight-rules ``.docx``.
     rules_docx: str
     output_root: str
     # Legacy / compat only: the live HUD loop uses :data:`LIVE_HUD_ROUND_CHECK_INTERVAL_SEC` (5s), not this field.
@@ -1177,7 +1488,12 @@ class PipelineConfig:
     # Portrait export (apply_portrait_blur): faster presets shorten CPU time vs ``slow`` + low CRF.
     portrait_blur_preset: str
     portrait_blur_crf: int
-    # Normalized ROI (0..1) for HUD score strip — ffmpeg crops this region before JPEG for vision.
+    # Output frame size for portrait MP4 (smaller → faster encode; default 1080×1920).
+    portrait_blur_width: int
+    portrait_blur_height: int
+    # Normalized ROI (0..1) on the **full broadcast frame**: HUD score strip for Rekognition.
+    # Defaults match a tighter horizontal band (legacy strip was 0.22 + width 0.56): scoreboard plus two
+    # square pics; trim dead space left and extra avatars / donation overlays right — adjust per broadcast layout.
     round_roi_x: float
     round_roi_y: float
     round_roi_w: float
@@ -1213,6 +1529,12 @@ class PipelineConfig:
     karaoke_ffmpeg_crf: int
     # Roster text path for CAPTIONS Vertex full-video karaoke (set by interactive session or JSON).
     karaoke_vertex_roster_path: str
+    # Extra ``streamlink`` CLI args before ``--stream-url`` (all page URLs).
+    streamlink_extra_args: List[str]
+    # Prepended for twitch.tv URLs only (defaults help Docker/Twitch flakey segments).
+    streamlink_twitch_extra_args: List[str]
+    # Timeout seconds for ``streamlink --stream-url`` (Docker/WSL DNS can need >45s).
+    streamlink_resolve_timeout_sec: int
 
 
 def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
@@ -1310,32 +1632,55 @@ class LiveRoundPipeline:
             )
 
         self.demo_path = Path(config.demo_file).resolve()
-        self.rules_docx_path = Path(config.rules_docx).resolve()
         if not self.demo_path.exists():
             raise FileNotFoundError(f"Demo file not found: {self.demo_path}")
-        if not self.rules_docx_path.exists():
-            raise FileNotFoundError(f"Rules DOCX not found: {self.rules_docx_path}")
 
-        self.rules_text = _extract_docx_text(self.rules_docx_path)
-        cp = (self.cfg.caption_provider or "auto").strip().lower()
-        if cp == "auto":
-            if (self.cfg.speech_api_key or "").strip():
-                print("[live] caption_provider=auto -> Google Speech captions (API key configured)", flush=True)
-            elif (self.cfg.caption_cmd_template or "").strip():
+        rules_raw = (config.rules_docx or "").strip()
+        self.rules_text = ""
+        if rules_raw:
+            rp = _resolve_rules_docx_path(rules_raw, config.pipeline_config_path)
+            self.rules_docx_path = rp
+            if not self.rules_docx_path.is_file():
+                raise FileNotFoundError(f"Rules DOCX not found: {self.rules_docx_path}")
+            self.rules_text = _extract_docx_text(self.rules_docx_path)
+            print(
+                f"[live] highlight rules_docx: {self.rules_docx_path.name} "
+                f"({len(self.rules_text)} chars → rules_context in Vertex prompt)",
+                flush=True,
+            )
+        else:
+            self.rules_docx_path = None
+            print("[live] highlight rules_docx: (none) — Vertex judge uses frames + generic criteria only", flush=True)
+
+        cp_raw = (self.cfg.caption_provider or "auto").strip().lower()
+        if cp_raw == "auto":
+            eff = self._resolve_caption_provider()
+            if eff == "shell":
                 print("[live] caption_provider=auto -> shell caption_cmd_template", flush=True)
-            else:
+            elif eff == "google_speech":
+                print("[live] caption_provider=auto -> Google Speech captions (API key configured)", flush=True)
+            elif eff == "karaoke_vertex":
+                async_note = "async (titles/post don't wait)" if self.cfg.karaoke_async else "blocking"
                 print(
-                    "[live] caption_provider=auto -> no Speech key / no caption template (captions off)",
+                    f"[live] caption_provider=auto -> karaoke_vertex ({async_note}; Vertex + CAPTIONS burn script)",
                     flush=True,
                 )
-        elif cp in ("karaoke_whisper", "karaoke_google"):
+            else:
+                print(
+                    "[live] caption_provider=auto -> no Speech key / no shell template / "
+                    "no usable Vertex karaoke stack (captions off)",
+                    flush=True,
+                )
+        elif cp_raw == "none":
+            print("[live] caption_provider=none (captions disabled)", flush=True)
+        elif cp_raw in ("karaoke_whisper", "karaoke_google"):
             async_note = "async (titles/post don't wait)" if self.cfg.karaoke_async else "blocking"
             print(
-                f"[live] caption_provider={cp} -> karaoke via multiprocessing child "
+                f"[live] caption_provider={cp_raw} -> karaoke via multiprocessing child "
                 f"({async_note}; transcribe_and_burn_karaoke)",
                 flush=True,
             )
-        elif cp == "karaoke_vertex":
+        elif cp_raw == "karaoke_vertex":
             async_note = "async (titles/post don't wait)" if self.cfg.karaoke_async else "blocking"
             print(
                 f"[live] caption_provider=karaoke_vertex -> CAPTIONS Vertex Gemini karaoke "
@@ -1474,6 +1819,7 @@ class LiveRoundPipeline:
         prompt: str,
         image_path: Optional[Path] = None,
         *,
+        audio_path: Optional[Path] = None,
         max_output_tokens: int = 1024,
     ) -> str:
         keys = self.cfg.vertex_api_keys
@@ -1497,6 +1843,7 @@ class LiveRoundPipeline:
                     model,
                     prompt,
                     image_path,
+                    audio_path=audio_path,
                     max_output_tokens=max_output_tokens,
                 )
                 if idx != self._vertex_key_index:
@@ -1568,40 +1915,70 @@ class LiveRoundPipeline:
 
         lower = src.lower()
         if "twitch.tv/" in lower or "youtube.com/" in lower or "youtu.be/" in lower:
-            # Prioritize local portable streamlink executable (supports nested extracted layout).
+            # Prefer portable Windows builds only on native Windows. Under Linux/macOS (including Docker bind-mounts),
+            # ./streamlink_portable/*.exe may exist from the host but must not run — use pip/system ``streamlink``.
             streamlink_exec: Optional[str] = None
-            portable_candidates = [
-                Path("./streamlink_portable/streamlink.exe"),
-                Path("./streamlink_portable/streamlink-8.3.0-1-py314-x86_64/bin/streamlink.exe"),
-            ]
-            for candidate in portable_candidates:
-                if candidate.exists():
-                    streamlink_exec = str(candidate.resolve())
-                    break
+            if sys.platform == "win32":
+                portable_candidates = [
+                    Path("./streamlink_portable/streamlink.exe"),
+                    Path("./streamlink_portable/streamlink-8.3.0-1-py314-x86_64/bin/streamlink.exe"),
+                ]
+                for candidate in portable_candidates:
+                    if candidate.exists():
+                        streamlink_exec = str(candidate.resolve())
+                        break
             if not streamlink_exec:
                 streamlink_exec = shutil.which("streamlink")
 
             if not streamlink_exec:
                 raise RuntimeError(
                     "streamlink is required for page URLs like Twitch/YouTube. "
-                    "Please ensure streamlink.exe is in ./streamlink_portable/ or streamlink is installed and in PATH."
+                    "On Windows: put streamlink.exe in ./streamlink_portable/ or install streamlink on PATH. "
+                    "On Linux/Docker: pip install streamlink (already in container image) or install streamlink on PATH."
                 )
+
+            twitch_low = "twitch.tv/" in lower
+            extras: List[str] = []
+            if twitch_low:
+                extras.extend(str(a).strip() for a in (self.cfg.streamlink_twitch_extra_args or []) if str(a).strip())
+            extras.extend(str(a).strip() for a in (self.cfg.streamlink_extra_args or []) if str(a).strip())
+            cmd = [streamlink_exec] + extras + ["--stream-url", src, "best"]
+            timeout_sec = max(15, int(self.cfg.streamlink_resolve_timeout_sec or 60))
+            if extras:
+                print(f"[live] streamlink resolve cmd: {streamlink_exec} {' '.join(extras)} --stream-url <url> best", flush=True)
             try:
                 proc = subprocess.run(
-                    [streamlink_exec, "--stream-url", src, "best"],
+                    cmd,
                     capture_output=True,
                     text=True,
-                    timeout=45,
+                    timeout=float(timeout_sec),
+                    env=os.environ.copy(),
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
-                    "streamlink --stream-url timed out after 45s (network, Twitch, or streamlink stuck)."
+                    f"streamlink --stream-url timed out after {timeout_sec}s (network, Twitch, or Docker/WSL DNS)."
                 ) from exc
             if proc.returncode != 0:
+                hint = ""
+                err_blob = f"{proc.stderr or ''}\n{proc.stdout or ''}".lower()
+                if not (proc.stderr or "").strip() and not (proc.stdout or "").strip():
+                    hint = (
+                        "\n[live] Hint: empty streamlink output often happens under Docker Desktop + WSL2 "
+                        "(vsock/socket errors). Try: restart Docker Desktop, update it, disable VPN briefly, "
+                        "or run the pipeline on Windows host (not container). "
+                        "Smoke test: docker compose run --rm streamlink-debug --stream-url \"TWITCH_URL\" best\n"
+                    )
+                elif "vsock" in err_blob or "utilbindvsock" in err_blob.replace(" ", ""):
+                    hint = (
+                        "\n[live] Hint: WSL/Docker networking glitch — restart Docker Desktop or run streamlink on "
+                        "the Windows host.\n"
+                    )
                 raise RuntimeError(
                     "Failed to resolve stream URL via streamlink.\n"
+                    f"cmd: {' '.join(cmd)}\n"
                     f"stdout:\n{proc.stdout}\n"
                     f"stderr:\n{proc.stderr}"
+                    f"{hint}"
                 )
             resolved = (proc.stdout or "").strip().splitlines()[-1].strip()
             if not resolved:
@@ -2265,30 +2642,168 @@ class LiveRoundPipeline:
             )
         return clip
 
-    def _extract_clip_analysis_frames(self, clip_path: Path, round_number: int) -> List[Path]:
-        frame_dir = self.meta_dir / f"clip_frames_round_{round_number:02d}_{_now_stamp()}"
-        _ensure_dir(frame_dir)
-        pattern = frame_dir / "frame_%03d.jpg"
-        cmd = [
-            self.ffmpeg,
+    def _extract_clip_analysis_audio(self, clip_path: Path, frame_dir: Path) -> Optional[Path]:
+        """Mono compressed audio excerpt for Vertex multimodal (MP3 preferred; AAC/M4A if lame missing)."""
+        ff = self.ffmpeg
+        if not ff:
+            return None
+        out_mp3 = frame_dir / "highlight_analysis_audio.mp3"
+        cmd_mp3 = [
+            ff,
             "-hide_banner",
             "-nostdin",
             "-y",
             "-i",
             str(clip_path),
-            "-vf",
-            "fps=1/8,scale=960:-2",
-            "-frames:v",
-            "10",
-            "-q:v",
-            "3",
-            str(pattern),
+            "-vn",
+            "-t",
+            str(HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "48k",
+            str(out_mp3),
         ]
-        _run_ffmpeg(cmd)
-        return sorted(frame_dir.glob("frame_*.jpg"))
+        try:
+            _run_ffmpeg(cmd_mp3)
+            if out_mp3.exists() and out_mp3.stat().st_size > 0:
+                sz = out_mp3.stat().st_size
+                print(
+                    f"[live] highlight analysis audio extracted (MP3): {sz / 1024:.1f} KiB "
+                    f"(mono 16 kHz, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s excerpt)",
+                    flush=True,
+                )
+                return out_mp3
+        except RuntimeError as exc:
+            print(f"[live] highlight analysis audio MP3 encode failed ({exc}); trying AAC/M4A…", flush=True)
+            pass
+        out_m4a = frame_dir / "highlight_analysis_audio.m4a"
+        cmd_aac = [
+            ff,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(clip_path),
+            "-vn",
+            "-t",
+            str(HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "48k",
+            str(out_m4a),
+        ]
+        try:
+            _run_ffmpeg(cmd_aac)
+            if out_m4a.exists() and out_m4a.stat().st_size > 0:
+                sz = out_m4a.stat().st_size
+                print(
+                    f"[live] highlight analysis audio extracted (AAC/M4A): {sz / 1024:.1f} KiB "
+                    f"(mono 16 kHz, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s excerpt)",
+                    flush=True,
+                )
+                return out_m4a
+        except RuntimeError as exc:
+            print(f"[live] highlight analysis audio AAC/M4A encode failed ({exc})", flush=True)
+            pass
+        print(
+            "[live] highlight analysis audio: extraction failed — Vertex highlight uses contact sheet only "
+            "(check clip has an audio stream; see recorded ffmpeg command uses -c:a aac)",
+            flush=True,
+        )
+        return None
+
+    def _extract_clip_analysis_frames(self, clip_path: Path, round_number: int) -> Tuple[List[Path], Optional[Path]]:
+        """Extract ``HIGHLIGHT_ANALYSIS_FRAME_COUNT`` JPEGs at equipart times + companion audio for Vertex."""
+        frame_dir = self.meta_dir / f"clip_frames_round_{round_number:02d}_{_now_stamp()}"
+        _ensure_dir(frame_dir)
+        ff = self.ffmpeg
+        if not ff:
+            raise RuntimeError("ffmpeg not configured")
+
+        k = HIGHLIGHT_ANALYSIS_FRAME_COUNT
+        dur = _clip_duration_for_analysis(clip_path, ff)
+        frames: List[Path] = []
+
+        if dur is not None and dur > 0:
+            times = _highlight_analysis_equipart_times(dur, k)
+            for i, t in enumerate(times):
+                out_j = frame_dir / f"frame_{i + 1:05d}.jpg"
+                cmd = [
+                    ff,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-y",
+                    "-ss",
+                    f"{t:.3f}",
+                    "-i",
+                    str(clip_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=960:-2",
+                    "-q:v",
+                    "3",
+                    str(out_j),
+                ]
+                _run_ffmpeg(cmd)
+                if out_j.exists() and out_j.stat().st_size > 0:
+                    frames.append(out_j)
+            if len(frames) < k:
+                print(
+                    f"[live] highlight frames: equipart extraction got {len(frames)}/{k}; falling back to fps sampling "
+                    f"(round={round_number})",
+                    flush=True,
+                )
+                for p in frames:
+                    p.unlink(missing_ok=True)
+                frames = []
+                for p in frame_dir.glob("frame_*.jpg"):
+                    p.unlink(missing_ok=True)
+
+        if not frames:
+            pattern = frame_dir / "frame_%05d.jpg"
+            cmd = [
+                ff,
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(clip_path),
+                "-vf",
+                "fps=1,scale=960:-2",
+                "-frames:v",
+                str(k),
+                "-q:v",
+                "3",
+                str(pattern),
+            ]
+            _run_ffmpeg(cmd)
+            frames = sorted(frame_dir.glob("frame_*.jpg"))[:k]
+
+        audio_path = self._extract_clip_analysis_audio(clip_path, frame_dir)
+        if dur is not None:
+            extra = f"; clip ~{dur:.1f}s"
+        else:
+            extra = ""
+        au = " + audio for Vertex" if audio_path else " (no audio → vision-only)"
+        print(
+            f"[live] highlight frames: {len(frames)} equipart/{k}{extra}{au}; round={round_number}",
+            flush=True,
+        )
+        return frames, audio_path
 
     def _build_clip_contact_sheet(self, frames: List[Path], round_number: int) -> Path:
-        selected = frames[:6]
+        selected = list(frames)
         if not selected:
             raise RuntimeError("No frames available for contact sheet")
 
@@ -2311,67 +2826,34 @@ class LiveRoundPipeline:
         sheet.save(out, "JPEG", quality=85, optimize=True)
         return out
 
-    def _analyze_clip_with_nvidia(self, clip_path: Path, round_number: int) -> Dict[str, Any]:
-        frames = self._extract_clip_analysis_frames(clip_path, round_number)
-        if not frames:
-            return {
-                "is_highlight": False,
-                "confidence": 0.0,
-                "why_highlight": [],
-                "why_not_highlight": ["no_analysis_frames_extracted"],
-                "final_reason": "No frames could be extracted for highlight analysis.",
-            }
+    def _normalize_highlight_analysis(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure ``round_description`` is a string and ``rejection_reason`` exists when rejected."""
+        rd_raw = analysis.get("round_description")
+        rd = rd_raw.strip() if isinstance(rd_raw, str) else ""
+        analysis = {**analysis, "round_description": rd}
 
-        contact_sheet = self._build_clip_contact_sheet(frames, round_number)
-        prompt = (
-            "You are judging a completed CS2 round clip from a contact sheet of sampled video frames. "
-            "Use ONLY the highlight criteria in rules_context as the decision rules. "
-            "Return strict JSON only: "
-            '{"is_highlight": boolean, "confidence": number 0-1, "why_highlight": [string], '
-            '"why_not_highlight": [string], "final_reason": string}. '
-            "Mark is_highlight=true only if the clip clearly matches the rules_context. "
-            "Reject normal rounds, low-action rounds, unclear footage, or clips that do not match the rules. "
-            f"Round context: round {round_number}.\n\n"
-            "rules_context:\n"
-            f"{self.rules_text[:5000]}"
-        )
-
-        payload = {
-            "model": self.cfg.nvidia_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": _file_data_url(contact_sheet)}},
-                    ],
-                }
-            ],
-            "max_tokens": 8192,
-            "temperature": 0.0,
-        }
-        try:
-            if self.cfg.highlight_yield_to_hud_vision:
-                self._yield_while_hud_remote_busy()
-            resp = _json_post(
-                f"{self.cfg.nvidia_base_url}/chat/completions",
-                self.cfg.nvidia_api_key,
-                payload,
-                timeout_sec=180,
-            )
-            return _extract_json(_chat_text(resp))
-        finally:
-            contact_sheet.unlink(missing_ok=True)
-            for frame in frames:
-                frame.unlink(missing_ok=True)
-            if frames:
-                frames[0].parent.rmdir()
+        ih = bool(analysis.get("is_highlight", False))
+        raw_rr = analysis.get("rejection_reason")
+        rr = raw_rr.strip() if isinstance(raw_rr, str) else ""
+        if ih:
+            return {**analysis, "rejection_reason": "", "round_description": rd}
+        if rr:
+            return {**analysis, "rejection_reason": rr}
+        parts: List[str] = []
+        fr = analysis.get("final_reason")
+        if isinstance(fr, str) and fr.strip():
+            parts.append(fr.strip())
+        wnh = analysis.get("why_not_highlight")
+        if isinstance(wnh, list) and wnh:
+            joined = "; ".join(str(x).strip() for x in wnh if str(x).strip())
+            if joined:
+                parts.append(joined)
+        fallback = " ".join(parts) if parts else "Model returned is_highlight=false without a rejection_reason."
+        return {**analysis, "rejection_reason": fallback, "round_description": rd}
 
     def _analyze_clip(self, clip_path: Path, round_number: int) -> Dict[str, Any]:
-        if self.cfg.highlight_api_provider == "nvidia":
-            return self._analyze_clip_with_nvidia(clip_path, round_number)
-
-        frames = self._extract_clip_analysis_frames(clip_path, round_number)
+        """Judge highlight-worthiness via Vertex Gemini (9-frame sheet + clip audio + optional ``rules_docx`` text)."""
+        frames, audio_path = self._extract_clip_analysis_frames(clip_path, round_number)
         if not frames:
             return {
                 "is_highlight": False,
@@ -2379,37 +2861,118 @@ class LiveRoundPipeline:
                 "why_highlight": [],
                 "why_not_highlight": ["no_analysis_frames_extracted"],
                 "final_reason": "No frames could be extracted for highlight analysis.",
+                "rejection_reason": "No frames could be extracted from the clip for vision analysis.",
+                "round_description": "No sampled frames available; the round could not be visually summarized.",
             }
 
-        contact_sheet = self._build_clip_contact_sheet(frames, round_number)
-        prompt = (
-            "You are judging a completed CS2 round clip from a contact sheet of sampled video frames. "
-            "Use ONLY the highlight criteria in rules_context as the decision rules. "
-            "Return strict JSON only: "
-            '{"is_highlight": boolean, "confidence": number 0-1, "why_highlight": [string], '
-            '"why_not_highlight": [string], "final_reason": string}. '
-            "Mark is_highlight=true only if the clip clearly matches the rules_context. "
-            "Reject normal rounds, low-action rounds, unclear footage, or clips that do not match the rules. "
-            f"Round context: round {round_number}.\n\n"
-            "rules_context:\n"
-            f"{self.rules_text[:5000]}"
+        sheet_frames = frames[:HIGHLIGHT_ANALYSIS_FRAME_COUNT]
+        contact_sheet = self._build_clip_contact_sheet(sheet_frames, round_number)
+        nf = len(sheet_frames)
+        rules_body = (self.rules_text or "").strip()
+        rules_section = ""
+        rules_instruction = ""
+        if rules_body:
+            excerpt = rules_body[:HIGHLIGHT_RULES_CONTEXT_MAX_CHARS]
+            rules_section = "rules_context:\n" + excerpt + "\n\n"
+            rules_instruction = (
+                "The following rules_context is plain text extracted from the project's highlight-rules Word document — "
+                "treat it as binding criteria for is_highlight and for rejection_reason when you reject. "
+                "Combine rules_context with the contact sheet AND the clip audio.\n\n"
+            )
+        audio_note = (
+            "Attached clip audio is the round's soundtrack (mono, excerpt). Listen for caster/player hype, clutch language, "
+            "skill callouts, laughter/screaming, and sudden loudness — cross-check against the 9 evenly spaced frames.\n\n"
+            if audio_path
+            else "No clip audio could be extracted; rely on the contact sheet only.\n\n"
         )
+        prompt = (
+            "You are judging a Counter-Strike 2 competitive round clip using multimodal evidence.\n\n"
+            + audio_note
+            + HIGHLIGHT_VERTEX_AUDIO_ANALYSIS_GUIDE
+            + "\n\n"
+            + rules_instruction
+            + rules_section
+            + f"There are exactly {nf} stills on one JPEG grid (3 columns × 3 rows), chronological left-to-right, top-to-bottom, "
+            "evenly spaced in time across the full clip duration (not uniform real-time fps sampling). "
+            + (
+                "Decide if this clip is social-media highlight–worthy using CS2/esports judgment "
+                + ("and rules_context where provided; " if rules_body else "")
+                + "including exciting gunplay, clutches, aces, economy swings, standout individual plays, knife/zeus moments, "
+                "meme-worthy or caster-bait moments when rules allow. "
+            )
+            + "Return strict JSON only (no markdown, no preamble): "
+            '{"is_highlight": boolean, "confidence": number 0-1, "round_description": string, "why_highlight": [string], '
+            '"why_not_highlight": [string], "final_reason": string, "rejection_reason": string, '
+            '"audio_evidence_summary": string, "highlight_signal_mix": string}. '
+            "audio_evidence_summary: 1–3 sentences on what you heard (speech themes, intensity spikes, laughter/screams, weak vs strong cues). "
+            "highlight_signal_mix: brief explanation of how audio + visuals combine (multi-signal vs single weak cue). "
+            "round_description MUST be 1–3 sentences describing what happens in this round from the frames "
+            "(map area if visible, trades, clutch, spike, economy reads, apparent outcome); say if footage is unclear. "
+            "Write round_description BEFORE your verdict reasoning. "
+            "When is_highlight is false: rejection_reason MUST be one detailed paragraph naming what you actually "
+            "see on the contact sheet and what you heard (if audio present)"
+            + (
+                " (specific cues: HUD state, kills/deaths visible, clutch timing, economy, reactions on audio)"
+                + (
+                    " and how that lines up with rules_context — "
+                    if rules_body
+                    else " and the concrete reason this fails as a clip-worthy highlight — "
+                )
+            )
+            + 'not vague wording like "not exciting". '
+            "When is_highlight is true: rejection_reason must be \"\" (empty string). "
+            + (
+                "Mark is_highlight=true only when the clip clearly satisfies rules_context AND multimodal evidence supports it; "
+                if rules_body
+                else "Set is_highlight=true when audio and/or visuals show unusually strong or clip-worthy moments per the guide above; "
+            )
+            + (
+                "reject when rules_context says non-highlight even if action looks flashy."
+                if rules_body
+                else "prefer false for slow default rounds, unclear frames, absent reactions, or nothing remarkable even if audio is noisy. "
+            )
+            + f"Round number for context only: {round_number}."
+        )
+        sheet_kb = contact_sheet.stat().st_size / 1024.0 if contact_sheet.is_file() else 0.0
+        audio_kb = audio_path.stat().st_size / 1024.0 if audio_path is not None and audio_path.is_file() else 0.0
+        self._append_jsonl(
+            self.meta_dir / "highlight_vertex_multimodal.jsonl",
+            {
+                "timestamp": _now_stamp(),
+                "round": round_number,
+                "clip": str(clip_path.resolve()),
+                "contact_sheet_kb": round(sheet_kb, 2),
+                "vertex_audio_attached": audio_path is not None,
+                "vertex_audio_kb": round(audio_kb, 2) if audio_path else 0.0,
+                "vertex_audio_suffix": audio_path.suffix if audio_path else "",
+                "note": "Temp audio/contact frames are deleted after this request; this log confirms payload.",
+            },
+        )
+        if audio_path is not None:
+            print(
+                f"[live] highlight Vertex multimodal: JPEG sheet ~{sheet_kb:.1f} KiB + "
+                f"audio ~{audio_kb:.1f} KiB ({audio_path.name}) — sending to Gemini",
+                flush=True,
+            )
+        else:
+            print(
+                f"[live] highlight Vertex: JPEG sheet ~{sheet_kb:.1f} KiB only (no audio attachment)",
+                flush=True,
+            )
         try:
             if self.cfg.highlight_yield_to_hud_vision:
                 self._yield_while_hud_remote_busy()
-            if self.cfg.highlight_api_provider == "vertex":
-                txt = self._vertex_generate_text_with_fallback(
-                    prompt, contact_sheet, max_output_tokens=8192
-                )
-            elif self.cfg.highlight_api_provider == "gemini":
-                txt = self._gemini_generate_text_with_fallback(
-                    prompt, contact_sheet, max_output_tokens=8192
-                )
-            else:
-                raise RuntimeError(f"Unexpected highlight_api_provider: {self.cfg.highlight_api_provider}")
-            return _extract_json(txt)
+            txt = self._vertex_generate_text_with_fallback(
+                prompt,
+                contact_sheet,
+                audio_path=audio_path,
+                max_output_tokens=8192,
+            )
+            return self._normalize_highlight_analysis(_extract_json(txt))
         finally:
             contact_sheet.unlink(missing_ok=True)
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
             for frame in frames:
                 frame.unlink(missing_ok=True)
             if frames:
@@ -2417,21 +2980,56 @@ class LiveRoundPipeline:
 
     def _edit_portrait_blur(self, clip_path: Path, round_number: int) -> Path:
         out = self.edit_dir / f"round_{round_number:02d}_{_now_stamp()}_portrait.mp4"
+        t0 = time.monotonic()
         apply_portrait_blur(
             clip_path,
             out,
             ffmpeg_bin=self.ffmpeg,
+            width=int(self.cfg.portrait_blur_width),
+            height=int(self.cfg.portrait_blur_height),
             crf=self.cfg.portrait_blur_crf,
             preset=self.cfg.portrait_blur_preset,
             fps=30.0,
         )
-        print(f"[live] portrait edit saved: {out.name}")
+        dt = time.monotonic() - t0
+        print(
+            f"[live] portrait edit saved: {out.name} "
+            f"({dt:.1f}s {self.cfg.portrait_blur_width}x{self.cfg.portrait_blur_height} "
+            f"preset={self.cfg.portrait_blur_preset} crf={self.cfg.portrait_blur_crf})",
+            flush=True,
+        )
         return out
 
-    def _run_caption_hook(self, edited_path: Path) -> Path:
-        provider = (self.cfg.caption_provider or "auto").strip().lower()
+    def _vertex_karaoke_auto_available(self) -> bool:
+        """True when Vertex CAPTIONS karaoke can run without an explicit ``caption_provider``."""
+        if not (self.cfg.vertex_project_id or "").strip() or not self.cfg.vertex_api_keys:
+            return False
+        script = _captions_vertex_burn_script_path()
+        if not script.is_file():
+            return False
+        rp = (self.cfg.karaoke_vertex_roster_path or "").strip()
+        if rp and not Path(rp).is_file():
+            return False
+        return True
+
+    def _resolve_caption_provider(self) -> str:
+        """Expand ``caption_provider=auto`` into a concrete backend (shell / Speech / Vertex karaoke / none)."""
+        raw = (self.cfg.caption_provider or "auto").strip().lower()
+        if raw != "auto":
+            return raw
         tpl = (self.cfg.caption_cmd_template or "").strip()
         key = (self.cfg.speech_api_key or "").strip()
+        if tpl:
+            return "shell"
+        if key:
+            return "google_speech"
+        if self._vertex_karaoke_auto_available():
+            return "karaoke_vertex"
+        return "none"
+
+    def _run_caption_hook(self, edited_path: Path) -> Path:
+        provider = self._resolve_caption_provider()
+        tpl = (self.cfg.caption_cmd_template or "").strip()
 
         if provider == "none":
             return edited_path
@@ -2442,11 +3040,10 @@ class LiveRoundPipeline:
                 return edited_path
             return self._caption_with_karaoke_subprocess(edited_path)
 
-        use_google = provider == "google_speech" or (provider == "auto" and bool(key))
-        if use_google:
+        if provider == "google_speech":
             return self._caption_with_google_speech(edited_path)
 
-        use_shell = provider == "shell" or (provider == "auto" and tpl)
+        use_shell = provider == "shell"
         if not use_shell or not tpl:
             return edited_path
 
@@ -2524,7 +3121,7 @@ class LiveRoundPipeline:
 
     def _karaoke_validate_can_run(self, edited_path: Path) -> bool:
         """Return False if karaoke_google / karaoke_vertex prerequisites are missing (Whisper path always OK)."""
-        provider = (self.cfg.caption_provider or "").strip().lower()
+        provider = self._resolve_caption_provider()
         if provider == "karaoke_vertex":
             if not self.cfg.vertex_project_id or not self.cfg.vertex_api_keys:
                 print("[live] karaoke_vertex: Vertex credentials missing; skipping karaoke task", flush=True)
@@ -2579,8 +3176,9 @@ class LiveRoundPipeline:
             pass
 
         def runner_wrap() -> None:
+            picked: Optional[Path] = None
             try:
-                pipeline._caption_with_karaoke_subprocess(edited_path)
+                picked = pipeline._caption_with_karaoke_subprocess(edited_path)
             except Exception as exc:
                 print(f"[live] karaoke background failed ({stem}): {exc}", flush=True)
             finally:
@@ -2588,11 +3186,28 @@ class LiveRoundPipeline:
                     pending.unlink(missing_ok=True)
                 except OSError:
                     pass
+                # Async mode initially copies portrait-only into *_final.mp4; promote karaoke here when ready.
+                if (
+                    picked is not None
+                    and picked.resolve() != edited_path.resolve()
+                    and picked.is_file()
+                    and picked.stat().st_size > 0
+                ):
+                    final_out = pipeline.final_dir / f"{stem}_final.mp4"
+                    try:
+                        shutil.copy2(picked, final_out)
+                        print(
+                            f"[live] karaoke async: captions burned → {picked.name}; "
+                            f"updated deliverable {final_out.name}",
+                            flush=True,
+                        )
+                    except OSError as exc:
+                        print(f"[live] karaoke async: could not update {final_out.name}: {exc}", flush=True)
 
         threading.Thread(target=runner_wrap, name=f"karaoke-bg-{stem}", daemon=True).start()
         print(
             f"[live] karaoke burning in background → {expected.name}; "
-            "titles/post use portrait copy immediately",
+            f"{stem}_final.mp4 is portrait-only until burn-in completes",
             flush=True,
         )
 
@@ -2601,7 +3216,7 @@ class LiveRoundPipeline:
 
         Dispatches Whisper/Google karaoke or CAPTIONS Vertex full-video karaoke.
         """
-        provider = (self.cfg.caption_provider or "").strip().lower()
+        provider = self._resolve_caption_provider()
         if provider == "karaoke_vertex":
             return self._caption_with_karaoke_vertex_subprocess(edited_path)
 
@@ -2859,11 +3474,15 @@ class LiveRoundPipeline:
             return edited_path
 
     def _final_video_path(self, edited_path: Path, captioned_path: Path) -> Path:
-        if captioned_path != edited_path:
-            return captioned_path
+        """Always materialize ``<stem>_final.mp4`` in ``round_final`` as the publishable deliverable.
 
+        When captions run inline, ``captioned_path`` is the karaoke/captioned file; we copy it to
+        ``*_final.mp4``. When ``karaoke_async`` is true, ``captioned_path`` equals ``edited_path``
+        initially (portrait only); the background karaoke thread overwrites ``*_final.mp4`` after burn-in.
+        """
         out = self.final_dir / f"{edited_path.stem}_final.mp4"
-        shutil.copy2(edited_path, out)
+        src = captioned_path if captioned_path != edited_path else edited_path
+        shutil.copy2(src, out)
         return out
 
     def _generate_title_and_seo(self, analysis: Dict[str, Any], round_number: int) -> Dict[str, Any]:
@@ -2878,42 +3497,10 @@ class LiveRoundPipeline:
             "caption": f"CS2 round {round_number} highlight.",
             "seo_keywords": ["CS2", "CounterStrike2", "esports", "gaming", "highlight"],
         }
-        # Match highlight clip analysis provider — do not force NVIDIA just because nvidia_api_key exists.
-        provider = (self.cfg.highlight_api_provider or "nvidia").strip().lower()
         parsed: Dict[str, Any]
         try:
-            if provider == "vertex":
-                txt = self._vertex_generate_text_with_fallback(
-                    prompt, None, max_output_tokens=1024
-                )
-                parsed = _extract_json(txt)
-            elif provider == "gemini":
-                txt = self._gemini_generate_text_with_fallback(
-                    prompt, None, max_output_tokens=1024
-                )
-                parsed = _extract_json(txt)
-            elif provider == "nvidia":
-                nv_key = (self.cfg.nvidia_api_key or "").strip()
-                if not nv_key:
-                    raise RuntimeError("nvidia_api_key required when highlight_api_provider is nvidia")
-                payload = {
-                    "model": self.cfg.nvidia_model,
-                    "messages": [
-                        {"role": "user", "content": [{"type": "text", "text": prompt}]},
-                    ],
-                    "max_tokens": 1024,
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                }
-                resp = _json_post(
-                    f"{self.cfg.nvidia_base_url}/chat/completions",
-                    nv_key,
-                    payload,
-                    timeout_sec=120,
-                )
-                parsed = _extract_json(_chat_text(resp))
-            else:
-                raise RuntimeError(f"Unsupported highlight_api_provider for titles: {provider}")
+            txt = self._vertex_generate_text_with_fallback(prompt, None, max_output_tokens=1024)
+            parsed = _extract_json(txt)
         except Exception as exc:
             print(f"[live] title/SEO generation failed, using fallback caption: {exc}")
             parsed = dict(fallback)
@@ -2970,17 +3557,30 @@ class LiveRoundPipeline:
             "analysis": analysis,
             "timestamp": _now_stamp(),
         }
+        rd = str(analysis.get("round_description", "") or "").strip()
+        if rd:
+            meta["round_description"] = rd
+            print(f"[live] round={round_number} round_description: {rd}", flush=True)
 
         if not bool(analysis.get("is_highlight", False)):
             meta["status"] = "rejected_non_highlight"
-            (self.meta_dir / f"round_{round_number:02d}_{_now_stamp()}_rejected.json").write_text(
-                json.dumps(meta, indent=2), encoding="utf-8"
-            )
-            print(f"[live] round={round_number} rejected by highlight rules")
+            rr = str(analysis.get("rejection_reason", "") or "").strip()
+            if rr:
+                meta["rejection_reason"] = rr
+            reject_path = self.meta_dir / f"round_{round_number:02d}_{_now_stamp()}_rejected.json"
+            reject_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            print(f"[live] round={round_number} rejected (non-highlight)", flush=True)
+            if rr:
+                print(f"[live] rejection_reason: {rr}", flush=True)
+            else:
+                print(
+                    f"[live] rejection_reason missing — see analysis in meta/{reject_path.name}",
+                    flush=True,
+                )
             return
 
         edited = self._edit_portrait_blur(clip_path, round_number)
-        cp_live = (self.cfg.caption_provider or "auto").strip().lower()
+        cp_live = self._resolve_caption_provider()
         captioned = self._run_caption_hook(edited)
         final_video = self._final_video_path(edited, captioned)
         text_pack = self._generate_title_and_seo(analysis, round_number)
@@ -3296,9 +3896,15 @@ def _pipeline_builtin_json_defaults() -> Dict[str, Any]:
         "screenshot_interval_sec": 5,
         "screenshot_4k_width": 3840,
         "api_provider": "rekognition",
-        "highlight_api_provider": "nvidia",
+        "highlight_api_provider": "vertex",
         "highlight_parallel_workers": 2,
         "highlight_yield_to_hud_vision": False,
+        "streamlink_extra_args": [],
+        "streamlink_twitch_extra_args": [
+            "--twitch-disable-ads",
+            "--twitch-disable-reruns",
+        ],
+        "streamlink_resolve_timeout_sec": 90,
     }
 
 
@@ -3340,6 +3946,12 @@ def _load_config(path: Path) -> PipelineConfig:
     cfg: Dict[str, Any] = {**_pipeline_builtin_json_defaults(), **raw_cfg}
     _merge_aws_credentials_local_file(path, cfg)
 
+    if not str(cfg.get("rules_docx", "") or "").strip():
+        cfg["rules_docx"] = str(DEFAULT_HIGHLIGHT_RULES_DOCX)
+        print(
+            f"[live] rules_docx not set in JSON — using default beside this module: {cfg['rules_docx']}",
+            flush=True,
+        )
     local_creds = path.resolve().parent / "aws_credentials.local.json"
     ak_merged = str(cfg.get("aws_access_key_id", "") or "").strip()
     sk_merged = str(cfg.get("aws_secret_access_key", "") or "").strip()
@@ -3361,10 +3973,13 @@ def _load_config(path: Path) -> PipelineConfig:
     api_provider = "rekognition"
 
     hl_raw = cfg.get("highlight_api_provider")
-    if hl_raw is None or str(hl_raw).strip() == "":
-        highlight_api_provider = "nvidia"
-    else:
-        highlight_api_provider = str(hl_raw).strip().lower()
+    if hl_raw is not None and str(hl_raw).strip().lower() not in ("vertex", ""):
+        print(
+            f"[live] ignoring highlight_api_provider={str(hl_raw).strip()!r} — "
+            "highlight analysis uses Vertex AI Gemini only",
+            flush=True,
+        )
+    highlight_api_provider = "vertex"
 
     gemini_api_key_val = cfg.get("gemini_api_key", "") or os.getenv("GEMINI_API_KEY", "")
     gemini_api_keys_val: List[str] = []
@@ -3377,9 +3992,6 @@ def _load_config(path: Path) -> PipelineConfig:
     if env_key:
         gemini_api_keys_val.append(env_key)
     gemini_api_keys_val = list(dict.fromkeys(gemini_api_keys_val))
-
-    if highlight_api_provider == "gemini" and not gemini_api_keys_val:
-        raise ValueError("highlight_api_provider=gemini requires gemini_api_key / gemini_api_keys in config or env")
 
     vertex_project_id = (
         str(cfg.get("vertex_project_id", "") or "").strip()
@@ -3400,18 +4012,16 @@ def _load_config(path: Path) -> PipelineConfig:
         vertex_api_keys_val.append(env_vertex)
     vertex_api_keys_val = list(dict.fromkeys(vertex_api_keys_val))
 
-    uses_vertex = highlight_api_provider == "vertex"
-    if uses_vertex:
-        if not vertex_project_id:
-            raise ValueError(
-                "vertex_project_id missing (set in JSON or VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT) "
-                "when using api_provider/highlight_api_provider vertex"
-            )
-        if not vertex_api_keys_val:
-            raise ValueError(
-                "vertex_api_keys missing (set vertex_api_key / vertex_api_keys or VERTEX_API_KEY) "
-                "when using Vertex AI"
-            )
+    if not vertex_project_id:
+        raise ValueError(
+            "vertex_project_id missing (set in JSON or VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT) "
+            "— required for Vertex AI highlight analysis"
+        )
+    if not vertex_api_keys_val:
+        raise ValueError(
+            "vertex_api_keys missing (set vertex_api_key / vertex_api_keys or VERTEX_API_KEY) "
+            "— required for Vertex AI highlight analysis"
+        )
 
     seek_sec = _parse_seek_seconds(cfg.get("stream_input_seek_sec"))
     if seek_sec <= 0:
@@ -3434,6 +4044,24 @@ def _load_config(path: Path) -> PipelineConfig:
 
     hl_yield_raw = cfg.get("highlight_yield_to_hud_vision")
     highlight_yield_to_hud_vision = False if hl_yield_raw is None else bool(hl_yield_raw)
+
+    raw_sl_extra = cfg.get("streamlink_extra_args")
+    if isinstance(raw_sl_extra, list):
+        streamlink_extra_args = [str(x).strip() for x in raw_sl_extra if str(x).strip()]
+    else:
+        streamlink_extra_args = []
+
+    raw_sl_tw = cfg.get("streamlink_twitch_extra_args")
+    if isinstance(raw_sl_tw, list):
+        streamlink_twitch_extra_args = [str(x).strip() for x in raw_sl_tw if str(x).strip()]
+    else:
+        streamlink_twitch_extra_args = ["--twitch-disable-ads", "--twitch-disable-reruns"]
+
+    try:
+        streamlink_resolve_timeout_sec = int(cfg.get("streamlink_resolve_timeout_sec", 90))
+    except (TypeError, ValueError):
+        streamlink_resolve_timeout_sec = 90
+    streamlink_resolve_timeout_sec = max(15, min(600, streamlink_resolve_timeout_sec))
 
     config = PipelineConfig(
         stream_url=cfg["stream_url"],
@@ -3462,7 +4090,7 @@ def _load_config(path: Path) -> PipelineConfig:
             (os.getenv("AWS_SESSION_TOKEN") or "").strip() or str(cfg.get("aws_session_token", "") or "").strip()
         ),
         demo_file=cfg["demo_file"],
-        rules_docx=cfg["rules_docx"],
+        rules_docx=str(cfg.get("rules_docx", "") or ""),
         output_root=cfg.get("output_root", "live_pipeline_output"),
         screenshot_interval_sec=int(cfg.get("screenshot_interval_sec", 5)),
         min_round_record_sec=int(cfg.get("min_round_record_sec", 20)),
@@ -3485,9 +4113,11 @@ def _load_config(path: Path) -> PipelineConfig:
         numpy_unsharp_amount=float(cfg.get("numpy_unsharp_amount", 1.35)),
         portrait_blur_preset=str(cfg.get("portrait_blur_preset", "medium") or "medium"),
         portrait_blur_crf=int(cfg.get("portrait_blur_crf", 20)),
-        round_roi_x=float(cfg.get("round_roi_x", 0.22)),
+        portrait_blur_width=int(cfg.get("portrait_blur_width", 1080)),
+        portrait_blur_height=int(cfg.get("portrait_blur_height", 1920)),
+        round_roi_x=float(cfg.get("round_roi_x", 0.304)),
         round_roi_y=float(cfg.get("round_roi_y", 0.00)),
-        round_roi_w=float(cfg.get("round_roi_w", 0.56)),
+        round_roi_w=float(cfg.get("round_roi_w", 0.364)),
         round_roi_h=float(cfg.get("round_roi_h", 0.24)),
         caption_cmd_template=cfg.get("caption_cmd_template", ""),
         caption_hook_timeout_sec=int(cfg.get("caption_hook_timeout_sec", 900)),
@@ -3513,6 +4143,9 @@ def _load_config(path: Path) -> PipelineConfig:
         karaoke_ffmpeg_preset=str(cfg.get("karaoke_ffmpeg_preset", "medium") or "medium"),
         karaoke_ffmpeg_crf=int(cfg.get("karaoke_ffmpeg_crf", 20)),
         karaoke_vertex_roster_path=karaoke_vertex_roster_resolved,
+        streamlink_extra_args=streamlink_extra_args,
+        streamlink_twitch_extra_args=streamlink_twitch_extra_args,
+        streamlink_resolve_timeout_sec=streamlink_resolve_timeout_sec,
     )
     if config.screenshot_interval_sec < 1:
         raise ValueError("screenshot_interval_sec must be >= 1")
@@ -3532,8 +4165,6 @@ def _load_config(path: Path) -> PipelineConfig:
         raise ValueError("stable_round_reads_to_start must be >= 1")
     if config.round_transition_confirmations < 1:
         raise ValueError("round_transition_confirmations must be >= 1")
-    if config.highlight_api_provider == "nvidia" and not (config.nvidia_api_key or "").strip():
-        raise ValueError("nvidia_api_key missing in config/env when highlight_api_provider is nvidia")
     if config.api_provider != "rekognition":
         raise ValueError("api_provider must be rekognition (HUD uses AWS DetectText only)")
     if config.screenshot_4k_width < 320 or config.screenshot_4k_width > 3840:
@@ -3552,6 +4183,10 @@ def _load_config(path: Path) -> PipelineConfig:
         raise ValueError("round_roi_w and round_roi_h must be > 0")
     if not (10 <= config.portrait_blur_crf <= 51):
         raise ValueError("portrait_blur_crf must be between 10 and 51")
+    if not (480 <= config.portrait_blur_width <= 2160):
+        raise ValueError("portrait_blur_width must be between 480 and 2160")
+    if not (854 <= config.portrait_blur_height <= 3840):
+        raise ValueError("portrait_blur_height must be between 854 and 3840")
     if not (10 <= config.karaoke_ffmpeg_crf <= 51):
         raise ValueError("karaoke_ffmpeg_crf must be between 10 and 51")
     if not str(config.portrait_blur_preset or "").strip():
@@ -3599,11 +4234,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Live stream CS2 highlight automation pipeline")
     parser.add_argument("--config", required=True, help="Path to JSON config file")
     parser.add_argument(
+        "--stream-url",
+        default=None,
+        metavar="URL",
+        help=(
+            "Override stream_url from JSON. With --interactive, skips URL prompts "
+            "(use for repeatable LIVE/VOD runs)."
+        ),
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help=(
-            "Prompt for stream URL, VOD timestamp, match roster paste (karaoke_vertex session). "
-            "Default is non-interactive: use JSON + builtin defaults only."
+            "Interactive setup: LIVE vs RECORDED; LIVE always asks for URL unless --stream-url is set "
+            "(JSON VOD presets are not reused when you pick LIVE). VOD may Enter to keep JSON URL; "
+            "optional match context (SKIP for none) → Gemini roster when notes provided."
         ),
     )
     parser.add_argument(
@@ -3637,11 +4282,14 @@ def main() -> int:
 
     cfg_path = Path(args.config).resolve()
     config = _load_config(cfg_path)
+    stream_url_from_cli = bool(args.stream_url is not None and str(args.stream_url).strip())
+    if stream_url_from_cli:
+        config = replace(config, stream_url=str(args.stream_url).strip())
 
     if args.interactive:
         print("", flush=True)
         print("[live] --- Interactive session ---", flush=True)
-        config = _interactive_session_configure(config)
+        config = _interactive_session_configure(config, stream_url_from_cli=stream_url_from_cli)
 
     overrides: Dict[str, Any] = {}
     if args.caption_provider is not None:
@@ -3663,8 +4311,10 @@ def main() -> int:
         }
         if config.caption_provider not in allowed_cp:
             raise ValueError(f"caption_provider must be one of {sorted(allowed_cp)}")
-    if config.highlight_api_provider == "gemini" and not config.gemini_api_keys:
-        raise ValueError("gemini_api_key missing in config/env")
+    if not (config.vertex_project_id or "").strip():
+        raise ValueError("vertex_project_id required for Vertex AI highlight analysis (config or env)")
+    if not config.vertex_api_keys:
+        raise ValueError("vertex_api_key / vertex_api_keys required for Vertex AI highlight analysis")
 
     pipeline = LiveRoundPipeline(config)
     pipeline.run_forever()
