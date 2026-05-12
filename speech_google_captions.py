@@ -33,21 +33,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-_speech_tls_fallback_logged = False
-
-
 def _google_https_ssl_context() -> ssl.SSLContext:
-    """TLS trust bundle for urllib → ``speech.googleapis.com``.
-
-    MSYS2 / some portable Pythons ship without usable system CAs, which yields
-    ``CERTIFICATE_VERIFY_FAILED``. Prefer ``SSL_CERT_FILE`` or ``certifi``.
-
-    When neither is available, falls back to **unverified** TLS for these Speech REST calls only
-    (still encrypted; weaker trust). Set ``SPEECH_TLS_STRICT=1`` to disable that fallback and fail fast.
-    """
-    global _speech_tls_fallback_logged
-    strict = os.environ.get("SPEECH_TLS_STRICT", "").strip().lower() in ("1", "true", "yes")
-
+    """TLS bundle for urllib → ``speech.googleapis.com`` (verified; uses certifi / SSL_CERT_FILE)."""
     cafile = (os.environ.get("SSL_CERT_FILE") or "").strip()
     if cafile and Path(cafile).is_file():
         return ssl.create_default_context(cafile=cafile)
@@ -55,20 +42,11 @@ def _google_https_ssl_context() -> ssl.SSLContext:
         import certifi
 
         return ssl.create_default_context(cafile=certifi.where())
-    except Exception:
-        pass
-    if strict:
-        return ssl.create_default_context()
-
-    if not _speech_tls_fallback_logged:
-        print(
-            "[speech] TLS: using unverified HTTPS context for Google Speech only (install ``certifi`` "
-            "or set ``SSL_CERT_FILE`` to a CA bundle for verification). "
-            "Set SPEECH_TLS_STRICT=1 to forbid this fallback.",
-            flush=True,
-        )
-        _speech_tls_fallback_logged = True
-    return ssl._create_unverified_context()
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot verify TLS for Google Speech REST — install ``certifi`` (`pip install certifi`) "
+            "or set SSL_CERT_FILE to a PEM CA bundle (TLS bypass removed)."
+        ) from exc
 
 
 def extract_linear16_wav_mono16k(video_path: Path, ffmpeg_bin: str, wav_out: Path) -> None:
