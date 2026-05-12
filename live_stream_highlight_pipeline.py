@@ -21,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -42,16 +43,57 @@ from detect_cs2_highlight import (
     _normalize_kill_time_column,
     _score_rounds,
 )
-from speech_google_captions import transcribe_and_burn
+from speech_google_captions import transcribe_and_burn, transcribe_google_long_wav
 from video_editor import apply_portrait_blur
+
+
+def _make_ssl_context() -> ssl.SSLContext:
+    """Strict TLS verification using ``SSL_CERT_FILE`` or certifi (no unverified fallback)."""
+    ca = (os.environ.get("SSL_CERT_FILE") or "").strip()
+    if ca and Path(ca).is_file():
+        return ssl.create_default_context(cafile=ca)
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError as exc:
+        raise RuntimeError(
+            "TLS: install certifi (`pip install certifi`) or set SSL_CERT_FILE to a PEM CA bundle."
+        ) from exc
+
 
 # Strict live HUD cadence: wall-clock period between successive crop → AI round checks.
 # ``PipelineConfig.screenshot_interval_sec`` is not used for this loop (kept for compatibility / timeouts).
 LIVE_HUD_ROUND_CHECK_INTERVAL_SEC = 5.0
 
-# Vertex highlight analysis: **9** equipart snapshots + clip audio for Gemini multimodal scoring.
+# Vertex highlight analysis: by default **9** equipart snapshots + clip audio; optional ``highlight_vertex_audio_only``
+# sends audio + ``rules_docx`` text only (no frame snapshots / contact sheet).
 HIGHLIGHT_ANALYSIS_FRAME_COUNT = 9
-HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC = 900  # cap audio excerpt length for inline Vertex payload (~size-safe at 48kbps mono).
+# Inline Vertex `generateContent` payload must stay ~≤10 MiB; 180 s @ 128 kbps mono is safe for typical rounds.
+HIGHLIGHT_VERTEX_INLINE_AUDIO_MAX_SEC = 180
+HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC = HIGHLIGHT_VERTEX_INLINE_AUDIO_MAX_SEC
+
+# Pre-analysis STT: Google REST syncRecognize is limited to ~1 min; we send at most this many seconds of LINEAR16.
+HIGHLIGHT_PREANALYSIS_STT_MAX_SEC = 58
+
+# Hype cues for transcript keyword pass (case-insensitive).
+HIGHLIGHT_HYPE_KEYWORD_PATTERNS = [
+    r"\bclutch\b",
+    r"\bace\b",
+    r"\binsane\b",
+    r"\bcrazy\b",
+    r"\bholy\b",
+    r"\bwtf\b",
+    r"\bclip\b",
+    r"\blet'?s go\b",
+    r"\bone v \d\b",
+    r"\b1v\d\b",
+    r"\bquad\b",
+    r"\bunbelievable\b",
+    r"\bwhat a play\b",
+    r"\bno way\b",
+    r"\brofl\b",
+]
 
 HIGHLIGHT_RULES_CONTEXT_MAX_CHARS = 8000
 
@@ -82,6 +124,29 @@ Fusion rule: The best highlights are multi-signal in a short window. Example: hy
 Visuals: You also get one JPEG contact sheet with exactly 9 thumbnails, evenly spaced in time across the full clip duration
 (left-to-right, top-to-bottom, chronological). Use audio and visuals together; require multi-signal or clearly explosive moments —
 do not mark highlights on generic praise or noise alone.
+""".strip()
+
+# Audio-only Vertex path (no images): rules_context + clip soundtrack; semantic alignment with the Word rules, not raw substring matching.
+HIGHLIGHT_VERTEX_AUDIO_ONLY_GUIDE = """
+Audio-only highlight scoring (listen to the attached clip audio; infer meaning and emotional intensity — align semantically
+with rules_context when provided; do not treat rules_context as a naive literal keyword grep unless it explicitly demands verbatim phrases):
+
+Signal families (examples, not exhaustive — same intent as the full multimodal guide):
+1) Direct hype / excitement (very high weight): e.g. OH MY GOD, NO WAY, WHAT WAS THAT, ARE YOU SERIOUS, INSANE, CRAZY,
+   WHAT THE HELL, BROOOOO, CLIP THAT, THAT'S A CLIP, SEND THAT, HIGHLIGHT RIGHT THERE.
+2) Kill streak / clutch (high weight): 1v2/1v3/1v4/1v5, CLUTCH, ACE, QUAD KILL, HE GOT ALL OF THEM, NO WAY HE WINS THIS,
+   HE WINS THESE, HE'S HIM, LAST GUY, ONE MORE.
+3) Skill / mechanics: ONE TAP, HEADSHOT, FLICK, INSANE FLICK, WHAT A SHOT, PIXEL, PRE-FIRE, SPRAYDOWN, TRACKING, CLEAN.
+4) Big brain / surprise: OUTPLAYED, HE READ HIM, WHAT A PLAY, 200 IQ, BIG BRAIN, FAKE, BAITED, MIND GAMES.
+5) Commentary-style: UNBELIEVABLE, ABSOLUTELY RIDICULOUS, YOU CAN'T WRITE THIS, THIS IS NOT REAL, HE'S DONE IT, WHAT A MOMENT.
+6) Non-verbal audio: sudden volume spikes, screaming, laughter bursts, sharp pitch rise — weight higher when clustered with strong speech.
+7) Chat / overlay if heard: CLIP, CLIP IT, WTF, HOLY, OMG, INSANE spam — useful mainly when combined with other signals.
+8) Weak alone: generic "nice", "good shot", "okay", "lol" — not highlight-worthy without stronger alignment to rules_context or explosive audio.
+
+Fusion: Prefer clips where multiple strong audio cues arrive in a short window. Reject routine calm casts, muzak-only segments,
+ unintelligible noise, or nothing that satisfies rules_context when rules_context is non-empty.
+
+No video frames are supplied — never invent HUD, killfeed, economy, map, or specific round outcomes from visuals; ground claims in speech and prosody only. If stakes are ambiguous, reflect that in round_description and lower confidence accordingly.
 """.strip()
 
 # Avoid calling streamlink on every HUD grab; tokens usually last long enough; retry with refresh on failure.
@@ -335,6 +400,73 @@ def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> L
     return [lo + usable * (i + 0.5) / k for i in range(k)]
 
 
+def _mono16_wav_rms_timeline(wav_path: Path, window_sec: float = 0.5) -> Tuple[List[float], List[float], float]:
+    """Sliding-window RMS for mono int16 WAV. Returns (window_center_times_sec, rms_0_1, sample_rate_hz)."""
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            nch = int(wf.getnchannels())
+            sw = int(wf.getsampwidth())
+            fr = int(wf.getframerate())
+            if sw != 2 or fr <= 0 or nch < 1:
+                return [], [], float(fr)
+            raw = wf.readframes(wf.getnframes())
+    except (wave.Error, OSError):
+        return [], [], 0.0
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+    if nch > 1:
+        audio = audio.reshape(-1, nch).mean(axis=1)
+    w = max(int(float(fr) * float(window_sec)), 256)
+    step = max(w // 2, 1)
+    centers: List[float] = []
+    rms_vals: List[float] = []
+    i = 0
+    while i + w <= len(audio):
+        chunk = audio[i : i + w]
+        rms = float(np.sqrt(np.mean(chunk * chunk)) / 32768.0)
+        centers.append((i + w / 2) / float(fr))
+        rms_vals.append(rms)
+        i += step
+    return centers, rms_vals, float(fr)
+
+
+def _summarize_rms_spikes(centers: List[float], rms_vals: List[float]) -> str:
+    if not rms_vals or not centers or len(rms_vals) != len(centers):
+        return "rms_windows=unavailable"
+    arr = np.asarray(rms_vals, dtype=np.float64)
+    med = float(np.median(arr))
+    p95 = float(np.percentile(arr, 95))
+    std = float(np.std(arr))
+    thresh = max(p95 * 0.9, med + max(2.5 * std, 1e-6))
+    hits: List[str] = []
+    for t, r in zip(centers, rms_vals):
+        if r >= thresh:
+            hits.append(f"{t:.2f}s~{r:.3f}")
+    top_i = int(np.argmax(arr))
+    peak_note = f"global_peak {centers[top_i]:.2f}s~{rms_vals[top_i]:.3f}"
+    if hits:
+        return (
+            f"median_rms={med:.4f} p95={p95:.4f} thresh~{thresh:.4f}; {peak_note}; "
+            f"loud_windows({len(hits)}): {', '.join(hits[:10])}"
+        )
+    return f"median_rms={med:.4f} p95={p95:.4f}; {peak_note} (no windows above adaptive threshold)"
+
+
+def _hype_hits_in_text(text: str) -> List[str]:
+    """Return which hype regexes matched (substring snippets)."""
+    if not (text or "").strip():
+        return []
+    low = text.lower()
+    out: List[str] = []
+    seen: set[str] = set()
+    for pat in HIGHLIGHT_HYPE_KEYWORD_PATTERNS:
+        if re.search(pat, low, re.IGNORECASE):
+            key = pat.strip("\\b")
+            if key not in seen:
+                seen.add(key)
+                out.append(pat.strip("^$")[:48])
+    return out[:24]
+
+
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -396,7 +528,7 @@ def _json_post(url: str, api_key: str, payload: Dict[str, Any], timeout_sec: int
         },
         method="POST",
     )
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = _make_ssl_context()
     try:
         with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
@@ -435,6 +567,22 @@ def _deprioritize_background_thread() -> None:
         kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
     except Exception:
         pass
+
+
+def _subprocess_creationflags_low_priority() -> int:
+    """Windows: start child processes (ffmpeg / CAPTIONS burn) below normal CPU priority.
+
+    Keeps the main HUD capture thread and interactive loop more responsive under heavy encode load.
+    On non-Windows, returns 0 (no extra flags).
+    """
+    if os.name != "nt":
+        return 0
+    try:
+        import subprocess as sp
+
+        return int(sp.CREATE_BELOW_NORMAL_PRIORITY_CLASS)
+    except (AttributeError, ValueError, TypeError):
+        return 0
 
 
 def _os_suspend_pid(pid: int, *, tag: str = "") -> bool:
@@ -671,7 +819,7 @@ def _vertex_generate_content(
         },
     }
 
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = _make_ssl_context()
     transient_http = frozenset({429, 500, 502, 503, 504})
     max_attempts = 8
     # Multimodal requests (large inline image and/or audio) often exceed ~120s server-side latency.
@@ -765,7 +913,7 @@ def _gemini_generate_text(
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     body = json.dumps(payload).encode("utf-8")
-    ssl_ctx = ssl._create_unverified_context()
+    ssl_ctx = _make_ssl_context()
     transient_http = frozenset({429, 500, 502, 503, 504})
     max_attempts = 8
     read_timeout_sec = 120.0 if image_path is not None else 180.0
@@ -829,14 +977,60 @@ def _mask_secret(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def _live_pipeline_repo_root() -> Path:
-    """Repo root containing ``CAPTIONS`` and ``Esports-Video-clipping-automation``."""
-    return Path(__file__).resolve().parent.parent
+def _captions_workspace_root() -> Path:
+    """Parent directory that contains ``CAPTIONS/burn_karaoke_captions.py``.
+
+    Mono-repo: ``ca/CAPTIONS`` next to ``ca/Esports-Video-clipping-automation`` (this file).
+    Docker (default compose): mount that folder at ``/app/CAPTIONS`` so ``/app`` is the returned root.
+
+    Override: ``CAPTIONS_BURN_SCRIPT`` = absolute path to ``burn_karaoke_captions.py``, or
+    ``CAPTIONS_KARAOKE_ROOT`` = parent of the ``CAPTIONS`` directory.
+    """
+    env_script = os.environ.get("CAPTIONS_BURN_SCRIPT", "").strip()
+    if env_script:
+        p = Path(env_script).expanduser().resolve()
+        if p.is_file():
+            return p.parent.parent.resolve()
+
+    env_root = os.environ.get("CAPTIONS_KARAOKE_ROOT", "").strip()
+    if env_root:
+        r = Path(env_root).expanduser().resolve()
+        if (r / "CAPTIONS" / "burn_karaoke_captions.py").is_file():
+            return r.resolve()
+
+    live_dir = Path(__file__).resolve().parent
+    for root in (live_dir.parent, live_dir):
+        if (root / "CAPTIONS" / "burn_karaoke_captions.py").is_file():
+            return root.resolve()
+    # Expected layout when using docker-compose ``../CAPTIONS:/app/CAPTIONS`` (script not mounted yet).
+    return live_dir.resolve()
 
 
 def _captions_vertex_burn_script_path() -> Path:
-    return _live_pipeline_repo_root() / "CAPTIONS" / "burn_karaoke_captions.py"
+    return _captions_workspace_root() / "CAPTIONS" / "burn_karaoke_captions.py"
 
+
+CAPTIONS_STANDALONE_OVERLAY_FALLBACK_NAME = "Screenshot 2026-05-01 164644.png"
+
+
+def _captions_sidecar_live_pipeline_json(esports_pipeline_config_used_to_start: Path) -> Path:
+    """Match ``CAPTIONS/burn_karaoke_captions.py`` default config choice for Vertex karaoke.
+
+    When ``CAPTIONS/live_pipeline_config.json`` exists it wins over the Esports copy so margin, logo sizing,
+    and encode settings match burns you run manually from CAPTIONS.
+    """
+    cap = _captions_workspace_root() / "CAPTIONS" / "live_pipeline_config.json"
+    if cap.is_file():
+        return cap.resolve()
+    return Path(esports_pipeline_config_used_to_start).resolve()
+
+
+def _safe_load_json_settings(path: Path) -> Dict[str, Any]:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return {}
 
 def _input_nonempty(prompt: str) -> str:
     while True:
@@ -1265,6 +1459,18 @@ def _rekognition_scores_from_crop(
             "IAM policy must allow rekognition:DetectText on resource * (image bytes)."
         ) from exc
     except ClientError as exc:
+        err_meta = exc.response.get("Error") or {}
+        code = str(err_meta.get("Code") or "").strip()
+        if code in ("UnrecognizedClientException", "InvalidClientTokenId"):
+            raise RuntimeError(
+                "AWS Rekognition refused these credentials "
+                f"({code}: invalid/expired access key or session token).\n"
+                "  • Long-term IAM: check AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.\n"
+                "  • Temporary keys: refresh AWS_SESSION_TOKEN (SSO/STS expire).\n"
+                "  • Docker Compose: unset wrong host env vars or pass fresh ones — they override "
+                "aws_credentials.local.json inside the merged config.\n"
+                f"  • Region used: {region_name}"
+            ) from exc
         err = str(exc)
         if "Unable to locate credentials" in err or "could not be found" in err.lower():
             raise RuntimeError(
@@ -1439,10 +1645,12 @@ class PipelineConfig:
     api_provider: str
     # Post-round highlight scoring (contact sheet → multimodal): **Vertex AI Gemini only** (loader forces ``vertex``).
     highlight_api_provider: str
-    # Background threads draining ``_highlight_queue`` (Vertex contact-sheet work).
+    # Background threads draining ``_highlight_queue`` (Vertex highlight work).
     highlight_parallel_workers: int
     # When True, highlight multimodal waits whenever HUD Rekognition/HTTP holds ``_hud_remote_calls_active``.
     highlight_yield_to_hud_vision: bool
+    # When True, Vertex post-round scoring sends clip audio + ``rules_docx`` text only — no JPEG grid / snapshots.
+    highlight_vertex_audio_only: bool
     gemini_api_key: str
     gemini_api_keys: List[str]
     gemini_model: str
@@ -1537,6 +1745,31 @@ class PipelineConfig:
     streamlink_resolve_timeout_sec: int
 
 
+def _vertex_karaoke_argv_from_prefs(prefs: Dict[str, Any]) -> List[str]:
+    """CLI flags aligned with ``CAPTIONS/burn_karaoke_captions.py`` ``_inject_pipeline_karaoke_defaults`` (Vertex mode).
+
+    Ensures margin / overlay / encode match standalone burns even when the JSON on disk is minimal.
+    """
+    out: List[str] = []
+    lang = str(prefs.get("speech_language_code") or "").strip()
+    if lang:
+        out += ["--language", lang]
+    out += ["--margin-top-ratio", str(float(prefs["margin_v_from_top_ratio"]))]
+    out += ["--overlay-width-frac", str(float(prefs["overlay_width_frac"]))]
+    out += ["--overlay-margin-bottom", str(int(prefs["overlay_margin_bottom_px"]))]
+    preset = str(prefs.get("encode_preset") or "medium").strip()
+    if preset:
+        out += ["--encode-preset", preset]
+    out += ["--encode-crf", str(int(prefs.get("encode_crf", 20)))]
+    if prefs.get("karaoke_no_overlay"):
+        out.append("--no-overlay")
+    else:
+        ov = prefs.get("overlay_image")
+        if isinstance(ov, Path) and ov.is_file():
+            out += ["--overlay-image", str(ov.resolve())]
+    return out
+
+
 def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
     """Spawn CAPTIONS ``burn_karaoke_captions.py`` (Vertex Gemini video karaoke)."""
     import subprocess
@@ -1544,9 +1777,11 @@ def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
 
     script = Path(payload["captions_script"])
     roster = str(payload.get("karaoke_vertex_roster_path") or "").strip()
-    cmd: List[str] = [
-        sys.executable,
-        str(script),
+    cmd: List[str] = [sys.executable, str(script)]
+    ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
+    if ffmpeg_bin:
+        cmd += ["--ffmpeg", ffmpeg_bin]
+    cmd += [
         "--video",
         str(payload["video_path"]),
         "--output",
@@ -1556,9 +1791,17 @@ def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
         "--work-dir",
         str(payload["work_dir"]),
     ]
+    extras = payload.get("karaoke_cli_extras")
+    if isinstance(extras, list) and extras:
+        cmd.extend(str(x) for x in extras)
     if roster:
         cmd += ["--match-stats-file", roster]
-    proc = subprocess.run(cmd, cwd=str(script.parent))
+    low = _subprocess_creationflags_low_priority()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(script.parent),
+        **({"creationflags": low} if low else {}),
+    )
     code = proc.returncode if proc.returncode is not None else 1
     raise SystemExit(code)
 
@@ -1719,6 +1962,7 @@ class LiveRoundPipeline:
         self._vision_coord_cv = threading.Condition(threading.Lock())
         self._hud_remote_calls_active = 0
         self._record_suspended_for_hud_idle = False
+        self._vision_auth_error_last_emit_monotonic: float = 0.0
 
     @contextlib.contextmanager
     def _hud_remote_activity_scope(self):
@@ -2642,11 +2886,130 @@ class LiveRoundPipeline:
             )
         return clip
 
+    def _analyze_audio_energy_and_transcript(self, clip_path: Path, work_dir: Path) -> str:
+        """RMS loudness timeline + short STT scan; returned block is injected before Vertex as ``AUDIO_PRE_ANALYSIS``."""
+        ff = self.ffmpeg
+        if not ff:
+            return ""
+        dur = _clip_duration_for_analysis(clip_path, ff)
+        cap = float(HIGHLIGHT_VERTEX_INLINE_AUDIO_MAX_SEC)
+        t_audio = cap if dur is None or dur <= 0 else min(cap, float(dur))
+
+        pre_wav = work_dir / "pre_analysis_mono16k.wav"
+        try:
+            _run_ffmpeg(
+                [
+                    ff,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(clip_path),
+                    "-vn",
+                    "-t",
+                    f"{t_audio:.3f}",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(pre_wav),
+                ]
+            )
+        except RuntimeError as exc:
+            return (
+                "AUDIO_PRE_ANALYSIS (local; failed):\n"
+                f"- wav_extract_error: {exc}\n"
+            )
+
+        if not pre_wav.is_file() or pre_wav.stat().st_size < 800:
+            return (
+                "AUDIO_PRE_ANALYSIS (local):\n"
+                "- no_usable_wav: clip may lack audio or be near-silent.\n"
+            )
+
+        centers, rms, _sr = _mono16_wav_rms_timeline(pre_wav, window_sec=0.5)
+        rms_line = _summarize_rms_spikes(centers, rms)
+
+        stt_sec = min(float(HIGHLIGHT_PREANALYSIS_STT_MAX_SEC), t_audio)
+        stt_wav = work_dir / "pre_analysis_stt_mono16k.wav"
+        try:
+            _run_ffmpeg(
+                [
+                    ff,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(pre_wav),
+                    "-t",
+                    f"{stt_sec:.3f}",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(stt_wav),
+                ]
+            )
+        except RuntimeError as exc:
+            transcript = ""
+            stt_note = f"stt_wav_trim_failed: {exc}"
+            try:
+                import whisper
+
+                model = whisper.load_model("tiny")
+                transcript = str((model.transcribe(str(pre_wav)) or {}).get("text") or "").strip()
+                stt_note += " | whisper_tiny(pre_wav)"
+            except Exception as exc2:
+                stt_note += f" | whisper_skip: {exc2}"
+        else:
+            stt_note = ""
+            transcript = ""
+            lang = (self.cfg.speech_language_code or "en-US").strip() or "en-US"
+            api_key = (self.cfg.speech_api_key or "").strip()
+            try:
+                _words, transcript = transcribe_google_long_wav(
+                    stt_wav,
+                    language_code=lang,
+                    timeout_sec=min(180.0, float(self.cfg.speech_recognition_timeout_sec or 600)),
+                    api_key=api_key if api_key else None,
+                )
+                stt_note = "google_cloud_speech (REST key or ADC)"
+            except Exception as exc:
+                stt_note = f"google_speech_failed: {exc}"
+                try:
+                    import whisper
+
+                    model = whisper.load_model("tiny")
+                    w_src = stt_wav if stt_wav.is_file() else pre_wav
+                    transcript = str((model.transcribe(str(w_src)) or {}).get("text") or "").strip()
+                    stt_note += " | whisper_tiny_fallback"
+                except Exception as exc2:
+                    transcript = ""
+                    stt_note += f" | transcription_unavailable: {exc2}"
+
+        hype_hits = _hype_hits_in_text(transcript or "")
+        hype_line = ", ".join(hype_hits) if hype_hits else "(no hype-keyword pattern hits)"
+
+        return (
+            "AUDIO_PRE_ANALYSIS (instrumental facts from local preprocessing; weight these heavily; "
+            "do not contradict them with invented audio claims):\n"
+            f"- excerpt_sec: min(clip, {HIGHLIGHT_VERTEX_INLINE_AUDIO_MAX_SEC}s) -> used {t_audio:.1f}s mono 16 kHz WAV\n"
+            f"- rms_loudness: {rms_line}\n"
+            f"- stt: {stt_note}\n"
+            f"- transcript_excerpt: {(transcript or '(empty)')[:1400]}\n"
+            f"- hype_keyword_hits: {hype_line}\n"
+        )
+
     def _extract_clip_analysis_audio(self, clip_path: Path, frame_dir: Path) -> Optional[Path]:
-        """Mono compressed audio excerpt for Vertex multimodal (MP3 preferred; AAC/M4A if lame missing)."""
+        """Mono excerpt for Vertex: prefer 128 kbps MP3 @ 22050 Hz; fallback AAC then WAV (PCM)."""
         ff = self.ffmpeg
         if not ff:
             return None
+        cap = str(int(HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC))
         out_mp3 = frame_dir / "highlight_analysis_audio.mp3"
         cmd_mp3 = [
             ff,
@@ -2657,15 +3020,15 @@ class LiveRoundPipeline:
             str(clip_path),
             "-vn",
             "-t",
-            str(HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC),
+            cap,
             "-ac",
             "1",
             "-ar",
-            "16000",
+            "22050",
             "-c:a",
             "libmp3lame",
             "-b:a",
-            "48k",
+            "128k",
             str(out_mp3),
         ]
         try:
@@ -2673,14 +3036,13 @@ class LiveRoundPipeline:
             if out_mp3.exists() and out_mp3.stat().st_size > 0:
                 sz = out_mp3.stat().st_size
                 print(
-                    f"[live] highlight analysis audio extracted (MP3): {sz / 1024:.1f} KiB "
-                    f"(mono 16 kHz, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s excerpt)",
+                    f"[live] highlight analysis audio (MP3): {sz / 1024:.1f} KiB "
+                    f"(mono 22050 Hz 128 kbps, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s)",
                     flush=True,
                 )
                 return out_mp3
         except RuntimeError as exc:
-            print(f"[live] highlight analysis audio MP3 encode failed ({exc}); trying AAC/M4A…", flush=True)
-            pass
+            print(f"[live] highlight analysis audio MP3 failed ({exc}); trying AAC…", flush=True)
         out_m4a = frame_dir / "highlight_analysis_audio.m4a"
         cmd_aac = [
             ff,
@@ -2691,15 +3053,15 @@ class LiveRoundPipeline:
             str(clip_path),
             "-vn",
             "-t",
-            str(HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC),
+            cap,
             "-ac",
             "1",
             "-ar",
-            "16000",
+            "22050",
             "-c:a",
             "aac",
             "-b:a",
-            "48k",
+            "128k",
             str(out_m4a),
         ]
         try:
@@ -2707,23 +3069,58 @@ class LiveRoundPipeline:
             if out_m4a.exists() and out_m4a.stat().st_size > 0:
                 sz = out_m4a.stat().st_size
                 print(
-                    f"[live] highlight analysis audio extracted (AAC/M4A): {sz / 1024:.1f} KiB "
-                    f"(mono 16 kHz, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s excerpt)",
+                    f"[live] highlight analysis audio (AAC): {sz / 1024:.1f} KiB "
+                    f"(mono 22050 Hz 128 kbps, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s)",
                     flush=True,
                 )
                 return out_m4a
         except RuntimeError as exc:
-            print(f"[live] highlight analysis audio AAC/M4A encode failed ({exc})", flush=True)
-            pass
-        print(
-            "[live] highlight analysis audio: extraction failed — Vertex highlight uses contact sheet only "
-            "(check clip has an audio stream; see recorded ffmpeg command uses -c:a aac)",
-            flush=True,
-        )
+            print(f"[live] highlight analysis audio AAC failed ({exc}); trying WAV PCM…", flush=True)
+        out_wav = frame_dir / "highlight_analysis_audio.wav"
+        cmd_wav = [
+            ff,
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(clip_path),
+            "-vn",
+            "-t",
+            cap,
+            "-ac",
+            "1",
+            "-ar",
+            "22050",
+            "-c:a",
+            "pcm_s16le",
+            str(out_wav),
+        ]
+        try:
+            _run_ffmpeg(cmd_wav)
+            if out_wav.exists() and out_wav.stat().st_size > 0:
+                sz = out_wav.stat().st_size
+                print(
+                    f"[live] highlight analysis audio (WAV PCM): {sz / 1024:.1f} KiB "
+                    f"(mono 22050 Hz, ≤{HIGHLIGHT_ANALYSIS_AUDIO_MAX_SEC}s)",
+                    flush=True,
+                )
+                return out_wav
+        except RuntimeError as exc:
+            print(f"[live] highlight analysis WAV extract failed ({exc})", flush=True)
+        if self.cfg.highlight_vertex_audio_only:
+            print(
+                "[live] highlight analysis audio: all extract modes failed — audio-only mode needs a readable audio track",
+                flush=True,
+            )
+        else:
+            print(
+                "[live] highlight analysis audio: extraction failed — Vertex highlight may be vision-only",
+                flush=True,
+            )
         return None
 
     def _extract_clip_analysis_frames(self, clip_path: Path, round_number: int) -> Tuple[List[Path], Optional[Path]]:
-        """Extract ``HIGHLIGHT_ANALYSIS_FRAME_COUNT`` JPEGs at equipart times + companion audio for Vertex."""
+        """Extract equipart JPEGs via **one** batched ffmpeg (``select``) when possible; else fps fallback."""
         frame_dir = self.meta_dir / f"clip_frames_round_{round_number:02d}_{_now_stamp()}"
         _ensure_dir(frame_dir)
         ff = self.ffmpeg
@@ -2736,39 +3133,81 @@ class LiveRoundPipeline:
 
         if dur is not None and dur > 0:
             times = _highlight_analysis_equipart_times(dur, k)
-            for i, t in enumerate(times):
-                out_j = frame_dir / f"frame_{i + 1:05d}.jpg"
-                cmd = [
+            span = max(0.03, min(0.12, float(dur) * 0.003))
+            expr = "+".join(
+                f"between(t\\,{max(0.0, t - span * 0.35):.6f}\\,{t + span:.6f})" for t in times
+            )
+            vf = f"select='{expr}',setpts=N/FRAME_RATE/TB,scale=960:-2"
+            out_pat = str(frame_dir / "eq_%03d.jpg")
+            batched_ok = False
+            try:
+                cmd_b = [
                     ff,
                     "-hide_banner",
                     "-nostdin",
                     "-y",
-                    "-ss",
-                    f"{t:.3f}",
                     "-i",
                     str(clip_path),
-                    "-frames:v",
-                    "1",
                     "-vf",
-                    "scale=960:-2",
+                    vf,
+                    "-frames:v",
+                    str(k),
                     "-q:v",
                     "3",
-                    str(out_j),
+                    out_pat,
                 ]
-                _run_ffmpeg(cmd)
-                if out_j.exists() and out_j.stat().st_size > 0:
-                    frames.append(out_j)
-            if len(frames) < k:
+                _run_ffmpeg(cmd_b)
+                cand = sorted(frame_dir.glob("eq_*.jpg"))
+                if len(cand) >= k:
+                    frames = cand[:k]
+                    batched_ok = True
+                elif len(cand) > 0:
+                    frames = cand
+            except RuntimeError as exc:
                 print(
-                    f"[live] highlight frames: equipart extraction got {len(frames)}/{k}; falling back to fps sampling "
-                    f"(round={round_number})",
+                    f"[live] highlight frames: batched select failed ({exc}); falling back to per-timestamp decode",
                     flush=True,
                 )
-                for p in frames:
+            if not batched_ok:
+                for p in frame_dir.glob("eq_*.jpg"):
                     p.unlink(missing_ok=True)
                 frames = []
-                for p in frame_dir.glob("frame_*.jpg"):
-                    p.unlink(missing_ok=True)
+                for i, t in enumerate(times):
+                    out_j = frame_dir / f"frame_{i + 1:05d}.jpg"
+                    cmd = [
+                        ff,
+                        "-hide_banner",
+                        "-nostdin",
+                        "-y",
+                        "-ss",
+                        f"{t:.3f}",
+                        "-i",
+                        str(clip_path),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        "scale=960:-2",
+                        "-q:v",
+                        "3",
+                        str(out_j),
+                    ]
+                    try:
+                        _run_ffmpeg(cmd)
+                        if out_j.exists() and out_j.stat().st_size > 0:
+                            frames.append(out_j)
+                    except RuntimeError:
+                        pass
+                if len(frames) < k:
+                    print(
+                        f"[live] highlight frames: equipart decode got {len(frames)}/{k}; clearing for fps fallback "
+                        f"(round={round_number})",
+                        flush=True,
+                    )
+                    for p in frames:
+                        p.unlink(missing_ok=True)
+                    for p in frame_dir.glob("frame_*.jpg"):
+                        p.unlink(missing_ok=True)
+                    frames = []
 
         if not frames:
             pattern = frame_dir / "frame_%05d.jpg"
@@ -2797,7 +3236,7 @@ class LiveRoundPipeline:
             extra = ""
         au = " + audio for Vertex" if audio_path else " (no audio → vision-only)"
         print(
-            f"[live] highlight frames: {len(frames)} equipart/{k}{extra}{au}; round={round_number}",
+            f"[live] highlight frames: {len(frames)} /{k}{extra}{au}; round={round_number}",
             flush=True,
         )
         return frames, audio_path
@@ -2852,114 +3291,250 @@ class LiveRoundPipeline:
         return {**analysis, "rejection_reason": fallback, "round_description": rd}
 
     def _analyze_clip(self, clip_path: Path, round_number: int) -> Dict[str, Any]:
-        """Judge highlight-worthiness via Vertex Gemini (9-frame sheet + clip audio + optional ``rules_docx`` text)."""
-        frames, audio_path = self._extract_clip_analysis_frames(clip_path, round_number)
-        if not frames:
-            return {
-                "is_highlight": False,
-                "confidence": 0.0,
-                "why_highlight": [],
-                "why_not_highlight": ["no_analysis_frames_extracted"],
-                "final_reason": "No frames could be extracted for highlight analysis.",
-                "rejection_reason": "No frames could be extracted from the clip for vision analysis.",
-                "round_description": "No sampled frames available; the round could not be visually summarized.",
-            }
+        """Judge highlight-worthiness via Vertex Gemini: default 9-frame sheet + audio; or audio + ``rules_docx`` only."""
+        frames: List[Path] = []
+        audio_path: Optional[Path] = None
+        contact_sheet: Optional[Path] = None
+        cleanup_dir: Optional[Path] = None
 
-        sheet_frames = frames[:HIGHLIGHT_ANALYSIS_FRAME_COUNT]
-        contact_sheet = self._build_clip_contact_sheet(sheet_frames, round_number)
-        nf = len(sheet_frames)
+        audio_only = bool(self.cfg.highlight_vertex_audio_only)
         rules_body = (self.rules_text or "").strip()
-        rules_section = ""
-        rules_instruction = ""
-        if rules_body:
-            excerpt = rules_body[:HIGHLIGHT_RULES_CONTEXT_MAX_CHARS]
-            rules_section = "rules_context:\n" + excerpt + "\n\n"
-            rules_instruction = (
-                "The following rules_context is plain text extracted from the project's highlight-rules Word document — "
-                "treat it as binding criteria for is_highlight and for rejection_reason when you reject. "
-                "Combine rules_context with the contact sheet AND the clip audio.\n\n"
-            )
-        audio_note = (
-            "Attached clip audio is the round's soundtrack (mono, excerpt). Listen for caster/player hype, clutch language, "
-            "skill callouts, laughter/screaming, and sudden loudness — cross-check against the 9 evenly spaced frames.\n\n"
-            if audio_path
-            else "No clip audio could be extracted; rely on the contact sheet only.\n\n"
-        )
-        prompt = (
-            "You are judging a Counter-Strike 2 competitive round clip using multimodal evidence.\n\n"
-            + audio_note
-            + HIGHLIGHT_VERTEX_AUDIO_ANALYSIS_GUIDE
-            + "\n\n"
-            + rules_instruction
-            + rules_section
-            + f"There are exactly {nf} stills on one JPEG grid (3 columns × 3 rows), chronological left-to-right, top-to-bottom, "
-            "evenly spaced in time across the full clip duration (not uniform real-time fps sampling). "
-            + (
-                "Decide if this clip is social-media highlight–worthy using CS2/esports judgment "
-                + ("and rules_context where provided; " if rules_body else "")
-                + "including exciting gunplay, clutches, aces, economy swings, standout individual plays, knife/zeus moments, "
-                "meme-worthy or caster-bait moments when rules allow. "
-            )
-            + "Return strict JSON only (no markdown, no preamble): "
-            '{"is_highlight": boolean, "confidence": number 0-1, "round_description": string, "why_highlight": [string], '
-            '"why_not_highlight": [string], "final_reason": string, "rejection_reason": string, '
-            '"audio_evidence_summary": string, "highlight_signal_mix": string}. '
-            "audio_evidence_summary: 1–3 sentences on what you heard (speech themes, intensity spikes, laughter/screams, weak vs strong cues). "
-            "highlight_signal_mix: brief explanation of how audio + visuals combine (multi-signal vs single weak cue). "
-            "round_description MUST be 1–3 sentences describing what happens in this round from the frames "
-            "(map area if visible, trades, clutch, spike, economy reads, apparent outcome); say if footage is unclear. "
-            "Write round_description BEFORE your verdict reasoning. "
-            "When is_highlight is false: rejection_reason MUST be one detailed paragraph naming what you actually "
-            "see on the contact sheet and what you heard (if audio present)"
-            + (
-                " (specific cues: HUD state, kills/deaths visible, clutch timing, economy, reactions on audio)"
-                + (
-                    " and how that lines up with rules_context — "
-                    if rules_body
-                    else " and the concrete reason this fails as a clip-worthy highlight — "
-                )
-            )
-            + 'not vague wording like "not exciting". '
-            "When is_highlight is true: rejection_reason must be \"\" (empty string). "
-            + (
-                "Mark is_highlight=true only when the clip clearly satisfies rules_context AND multimodal evidence supports it; "
-                if rules_body
-                else "Set is_highlight=true when audio and/or visuals show unusually strong or clip-worthy moments per the guide above; "
-            )
-            + (
-                "reject when rules_context says non-highlight even if action looks flashy."
-                if rules_body
-                else "prefer false for slow default rounds, unclear frames, absent reactions, or nothing remarkable even if audio is noisy. "
-            )
-            + f"Round number for context only: {round_number}."
-        )
-        sheet_kb = contact_sheet.stat().st_size / 1024.0 if contact_sheet.is_file() else 0.0
-        audio_kb = audio_path.stat().st_size / 1024.0 if audio_path is not None and audio_path.is_file() else 0.0
-        self._append_jsonl(
-            self.meta_dir / "highlight_vertex_multimodal.jsonl",
-            {
-                "timestamp": _now_stamp(),
-                "round": round_number,
-                "clip": str(clip_path.resolve()),
-                "contact_sheet_kb": round(sheet_kb, 2),
-                "vertex_audio_attached": audio_path is not None,
-                "vertex_audio_kb": round(audio_kb, 2) if audio_path else 0.0,
-                "vertex_audio_suffix": audio_path.suffix if audio_path else "",
-                "note": "Temp audio/contact frames are deleted after this request; this log confirms payload.",
-            },
-        )
-        if audio_path is not None:
-            print(
-                f"[live] highlight Vertex multimodal: JPEG sheet ~{sheet_kb:.1f} KiB + "
-                f"audio ~{audio_kb:.1f} KiB ({audio_path.name}) — sending to Gemini",
-                flush=True,
-            )
-        else:
-            print(
-                f"[live] highlight Vertex: JPEG sheet ~{sheet_kb:.1f} KiB only (no audio attachment)",
-                flush=True,
-            )
+        audio_pre_block = ""
+
         try:
+            if audio_only:
+                cleanup_dir = self.meta_dir / f"clip_vertex_audio_only_round_{round_number:02d}_{_now_stamp()}"
+                _ensure_dir(cleanup_dir)
+                audio_path = self._extract_clip_analysis_audio(clip_path, cleanup_dir)
+                if audio_path is None:
+                    return {
+                        "is_highlight": False,
+                        "confidence": 0.0,
+                        "why_highlight": [],
+                        "why_not_highlight": ["no_highlight_analysis_audio"],
+                        "final_reason": "Highlight analysis audio could not be extracted from this clip.",
+                        "rejection_reason": "audio-only Vertex mode requires a clip audio stream; ffmpeg extraction failed.",
+                        "round_description": "No soundtrack available for inferred summary.",
+                    }
+                ff = self.ffmpeg
+                dur = _clip_duration_for_analysis(clip_path, ff) if ff else None
+                dur_bit = f"~{dur:.1f}s" if dur is not None and dur > 0 else "unknown duration"
+                print(
+                    f"[live] highlight Vertex audio-only: mono excerpt ({dur_bit}) + rules text — no frame snapshots",
+                    flush=True,
+                )
+
+                audio_pre_block = self._analyze_audio_energy_and_transcript(clip_path, cleanup_dir)
+
+                rules_section = ""
+                rules_instruction = ""
+                if rules_body:
+                    excerpt = rules_body[:HIGHLIGHT_RULES_CONTEXT_MAX_CHARS]
+                    rules_section = "rules_context:\n" + excerpt + "\n\n"
+                    rules_instruction = (
+                        "The following rules_context is plain text extracted from the project's highlight-rules Word document — "
+                        "treat it as binding criteria for is_highlight and for rejection_reason when you reject. "
+                        "Combine rules_context with what you infer from the clip audio ONLY (semantic fit, not substring matching "
+                        "unless rules_context explicitly requires verbatim phrases).\n\n"
+                    )
+
+                audio_note = (
+                    "Attached clip audio is the round's soundtrack (mono, excerpt). "
+                    "Judge highlight-worthiness from speech, caster energy, hype/clutch vocabulary, laughs/screams, and dynamics — "
+                    "aligned with rules_context.\n\n"
+                )
+                prompt = (
+                    "You are judging Counter-Strike 2 broadcast audio for clip / social highlight potential. "
+                    "NO video, thumbnails, or HUD images are supplied — ignore visuals entirely.\n\n"
+                    + audio_note
+                    + "\n"
+                    + audio_pre_block
+                    + "\n"
+                    + HIGHLIGHT_VERTEX_AUDIO_ONLY_GUIDE
+                    + "\n\n"
+                    + rules_instruction
+                    + rules_section
+                    + (
+                        "Decide if this excerpt is highlight–worthy using CS2/esports caster/listener judgment "
+                        + ("and rules_context where provided; " if rules_body else "")
+                        + "inferring stakes and hype from AUDIO ONLY. "
+                    )
+                    + "Return strict JSON only (no markdown, no preamble): "
+                    '{"is_highlight": boolean, "confidence": number 0-1, "round_description": string, "why_highlight": [string], '
+                    '"why_not_highlight": [string], "final_reason": string, "rejection_reason": string, '
+                    '"audio_evidence_summary": string, "highlight_signal_mix": string}. '
+                    "audio_evidence_summary: 1–3 sentences on what you heard (themes, spikes, weak vs strong). "
+                    "highlight_signal_mix: explain how fused audio cues (and alignment with rules_context) support the verdict — "
+                    "state explicitly that scoring is audio-only. "
+                    "round_description MUST be 1–3 sentences summarizing plausible in-round narrative inferred from AUDIO ONLY "
+                    "(e.g., apparent clutch hype, ace calls, chaotic teamfight energy); say when inference is uncertain. "
+                    "Write round_description BEFORE verdict reasoning. "
+                    "When is_highlight is false: rejection_reason MUST be one detailed paragraph on what audio showed "
+                    "(or lacked)"
+                    + (
+                        " versus rules_context expectations — "
+                        if rules_body
+                        else " versus strong highlight audio patterns — "
+                    )
+                    + 'no vague wording like "not exciting". '
+                    "When is_highlight is true: rejection_reason must be \"\" (empty string). "
+                    + (
+                        "Mark is_highlight=true only when rules_context (if provided) clearly supports highlighting AND "
+                        "audio evidence backs it;"
+                        if rules_body
+                        else "Set is_highlight=true when audio shows unusually explosive or clip-worthy moments per the guide; "
+                    )
+                    + (
+                        " reject when rules_context forbids highlighting even if casters sound loud."
+                        if rules_body
+                        else " prefer false for calm rundowns or ambiguous low-energy chatter."
+                    )
+                    + f" Round number for context only: {round_number}."
+                )
+                sheet_kb = 0.0
+                audio_kb = audio_path.stat().st_size / 1024.0 if audio_path.is_file() else 0.0
+                self._append_jsonl(
+                    self.meta_dir / "highlight_vertex_multimodal.jsonl",
+                    {
+                        "timestamp": _now_stamp(),
+                        "round": round_number,
+                        "clip": str(clip_path.resolve()),
+                        "highlight_vertex_audio_only": True,
+                        "contact_sheet_kb": 0.0,
+                        "vertex_audio_attached": True,
+                        "vertex_audio_kb": round(audio_kb, 2),
+                        "vertex_audio_suffix": audio_path.suffix if audio_path else "",
+                        "note": "Temp audio excerpt deleted after this request; no JPEG contact sheet.",
+                    },
+                )
+                print(
+                    f"[live] highlight Vertex audio-only: sending audio ~{audio_kb:.1f} KiB ({audio_path.name}) — no JPEG",
+                    flush=True,
+                )
+                if self.cfg.highlight_yield_to_hud_vision:
+                    self._yield_while_hud_remote_busy()
+                txt = self._vertex_generate_text_with_fallback(
+                    prompt,
+                    None,
+                    audio_path=audio_path,
+                    max_output_tokens=8192,
+                )
+                return self._normalize_highlight_analysis(_extract_json(txt))
+
+            # Multimodal: equipart snapshots + optional audio + optional rules_docx
+            pre_dir = self.meta_dir / f"hl_preanalysis_r{round_number:02d}_{_now_stamp()}"
+            _ensure_dir(pre_dir)
+            audio_pre_block = self._analyze_audio_energy_and_transcript(clip_path, pre_dir)
+
+            frames, audio_path = self._extract_clip_analysis_frames(clip_path, round_number)
+            cleanup_dir = frames[0].parent if frames else None
+            if not frames:
+                return {
+                    "is_highlight": False,
+                    "confidence": 0.0,
+                    "why_highlight": [],
+                    "why_not_highlight": ["no_analysis_frames_extracted"],
+                    "final_reason": "No frames could be extracted for highlight analysis.",
+                    "rejection_reason": "No frames could be extracted from the clip for vision analysis.",
+                    "round_description": "No sampled frames available; the round could not be visually summarized.",
+                }
+
+            sheet_frames = frames[:HIGHLIGHT_ANALYSIS_FRAME_COUNT]
+            contact_sheet = self._build_clip_contact_sheet(sheet_frames, round_number)
+            nf = len(sheet_frames)
+            rules_section = ""
+            rules_instruction = ""
+            if rules_body:
+                excerpt = rules_body[:HIGHLIGHT_RULES_CONTEXT_MAX_CHARS]
+                rules_section = "rules_context:\n" + excerpt + "\n\n"
+                rules_instruction = (
+                    "The following rules_context is plain text extracted from the project's highlight-rules Word document — "
+                    "treat it as binding criteria for is_highlight and for rejection_reason when you reject. "
+                    "Combine rules_context with the contact sheet AND the clip audio.\n\n"
+                )
+            audio_note = (
+                "Attached clip audio is the round's soundtrack (mono, excerpt). Listen for caster/player hype, clutch language, "
+                "skill callouts, laughter/screaming, and sudden loudness — cross-check against the 9 evenly spaced frames.\n\n"
+                if audio_path
+                else "No clip audio could be extracted; rely on the contact sheet only.\n\n"
+            )
+            prompt = (
+                "You are judging a Counter-Strike 2 competitive round clip using multimodal evidence.\n\n"
+                + audio_note
+                + audio_pre_block
+                + "\n"
+                + HIGHLIGHT_VERTEX_AUDIO_ANALYSIS_GUIDE
+                + "\n\n"
+                + rules_instruction
+                + rules_section
+                + f"There are exactly {nf} stills on one JPEG grid (3 columns × 3 rows), chronological left-to-right, top-to-bottom, "
+                "evenly spaced in time across the full clip duration (not uniform real-time fps sampling). "
+                + (
+                    "Decide if this clip is social-media highlight–worthy using CS2/esports judgment "
+                    + ("and rules_context where provided; " if rules_body else "")
+                    + "including exciting gunplay, clutches, aces, economy swings, standout individual plays, knife/zeus moments, "
+                    "meme-worthy or caster-bait moments when rules allow. "
+                )
+                + "Return strict JSON only (no markdown, no preamble): "
+                '{"is_highlight": boolean, "confidence": number 0-1, "round_description": string, "why_highlight": [string], '
+                '"why_not_highlight": [string], "final_reason": string, "rejection_reason": string, '
+                '"audio_evidence_summary": string, "highlight_signal_mix": string}. '
+                "audio_evidence_summary: 1–3 sentences on what you heard (speech themes, intensity spikes, laughter/screams, weak vs strong cues). "
+                "highlight_signal_mix: brief explanation of how audio + visuals combine (multi-signal vs single weak cue). "
+                "round_description MUST be 1–3 sentences describing what happens in this round from the frames "
+                "(map area if visible, trades, clutch, spike, economy reads, apparent outcome); say if footage is unclear. "
+                "Write round_description BEFORE your verdict reasoning. "
+                "When is_highlight is false: rejection_reason MUST be one detailed paragraph naming what you actually "
+                "see on the contact sheet and what you heard (if audio present)"
+                + (
+                    " (specific cues: HUD state, kills/deaths visible, clutch timing, economy, reactions on audio)"
+                    + (
+                        " and how that lines up with rules_context — "
+                        if rules_body
+                        else " and the concrete reason this fails as a clip-worthy highlight — "
+                    )
+                )
+                + 'not vague wording like "not exciting". '
+                "When is_highlight is true: rejection_reason must be \"\" (empty string). "
+                + (
+                    "Mark is_highlight=true only when the clip clearly satisfies rules_context AND multimodal evidence supports it; "
+                    if rules_body
+                    else "Set is_highlight=true when audio and/or visuals show unusually strong or clip-worthy moments per the guide above; "
+                )
+                + (
+                    "reject when rules_context says non-highlight even if action looks flashy."
+                    if rules_body
+                    else "prefer false for slow default rounds, unclear frames, absent reactions, or nothing remarkable even if audio is noisy. "
+                )
+                + f"Round number for context only: {round_number}."
+            )
+            sheet_kb = contact_sheet.stat().st_size / 1024.0 if contact_sheet.is_file() else 0.0
+            audio_kb = audio_path.stat().st_size / 1024.0 if audio_path is not None and audio_path.is_file() else 0.0
+            self._append_jsonl(
+                self.meta_dir / "highlight_vertex_multimodal.jsonl",
+                {
+                    "timestamp": _now_stamp(),
+                    "round": round_number,
+                    "clip": str(clip_path.resolve()),
+                    "highlight_vertex_audio_only": False,
+                    "contact_sheet_kb": round(sheet_kb, 2),
+                    "vertex_audio_attached": audio_path is not None,
+                    "vertex_audio_kb": round(audio_kb, 2) if audio_path else 0.0,
+                    "vertex_audio_suffix": audio_path.suffix if audio_path else "",
+                    "note": "Temp audio/contact frames are deleted after this request; this log confirms payload.",
+                },
+            )
+            if audio_path is not None:
+                print(
+                    f"[live] highlight Vertex multimodal: JPEG sheet ~{sheet_kb:.1f} KiB + "
+                    f"audio ~{audio_kb:.1f} KiB ({audio_path.name}) — sending to Gemini",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[live] highlight Vertex: JPEG sheet ~{sheet_kb:.1f} KiB only (no audio attachment)",
+                    flush=True,
+                )
             if self.cfg.highlight_yield_to_hud_vision:
                 self._yield_while_hud_remote_busy()
             txt = self._vertex_generate_text_with_fallback(
@@ -2970,13 +3545,17 @@ class LiveRoundPipeline:
             )
             return self._normalize_highlight_analysis(_extract_json(txt))
         finally:
-            contact_sheet.unlink(missing_ok=True)
+            if contact_sheet is not None:
+                contact_sheet.unlink(missing_ok=True)
             if audio_path is not None:
                 audio_path.unlink(missing_ok=True)
             for frame in frames:
                 frame.unlink(missing_ok=True)
-            if frames:
-                frames[0].parent.rmdir()
+            if cleanup_dir is not None and cleanup_dir.is_dir():
+                try:
+                    cleanup_dir.rmdir()
+                except OSError:
+                    pass
 
     def _edit_portrait_blur(self, clip_path: Path, round_number: int) -> Path:
         out = self.edit_dir / f"round_{round_number:02d}_{_now_stamp()}_portrait.mp4"
@@ -3036,6 +3615,12 @@ class LiveRoundPipeline:
 
         if provider in ("karaoke_whisper", "karaoke_google", "karaoke_vertex"):
             if self.cfg.karaoke_async:
+                print(
+                    "[live] karaoke_async=true: portrait-only copy goes to *_final.mp4 first; "
+                    "karaoke overwrites *_final.mp4 when the burn finishes (or run with --karaoke-sync). "
+                    "Watch for *_karaoke.mp4 in round_final/.",
+                    flush=True,
+                )
                 self._karaoke_start_background(edited_path)
                 return edited_path
             return self._caption_with_karaoke_subprocess(edited_path)
@@ -3100,24 +3685,55 @@ class LiveRoundPipeline:
             return edited_path
         return out
 
-    def _resolve_karaoke_overlay_image(self, edited_path: Path) -> Optional[Path]:
-        """PNG/JPEG path for branding overlay, or None."""
-        if self.cfg.karaoke_no_overlay:
-            return None
-        raw_ov = (self.cfg.karaoke_overlay_image or "").strip()
-        if raw_ov:
-            ov_path = Path(raw_ov)
-            if not ov_path.is_absolute():
-                ov_path = (self.cfg.pipeline_config_path.parent / ov_path).resolve()
-            if ov_path.is_file():
-                return ov_path
-            print(
-                f"[live] karaoke_overlay_image not found ({ov_path}); "
-                "falling back to auto PNG beside clip if present",
-                flush=True,
-            )
-        cand = edited_path.parent / "Screenshot 2026-05-01 164644.png"
-        return cand if cand.is_file() else None
+    def _karaoke_burn_preferences(self, video_hint: Path) -> Dict[str, Any]:
+        """Karaoke ASS + logo layout + encode — same source of truth as ``CAPTIONS/burn_karaoke_captions.py``.
+
+        Prefer ``CAPTIONS/live_pipeline_config.json`` when present (standalone default there); otherwise values from
+        ``self.cfg``'s JSON path. Logo path resolution matches ``CAPTIONS/_resolve_overlay_image``.
+        """
+        cfg_disk = _captions_sidecar_live_pipeline_json(self.cfg.pipeline_config_path)
+        raw = _safe_load_json_settings(cfg_disk)
+        c = self.cfg
+
+        def pick(key: str, fallback: Any) -> Any:
+            return raw[key] if key in raw else fallback
+
+        margin = float(pick("karaoke_margin_top_ratio", c.karaoke_margin_top_ratio))
+        owf = float(pick("karaoke_overlay_width_frac", c.karaoke_overlay_width_frac))
+        omb = int(pick("karaoke_overlay_margin_bottom_px", c.karaoke_overlay_margin_bottom_px))
+        preset = str(pick("karaoke_ffmpeg_preset", c.karaoke_ffmpeg_preset) or "medium").strip()
+        crf = int(pick("karaoke_ffmpeg_crf", c.karaoke_ffmpeg_crf))
+        use_adc = bool(pick("karaoke_use_adc", c.karaoke_use_adc))
+        no_overlay = bool(pick("karaoke_no_overlay", c.karaoke_no_overlay))
+        wm = str(pick("karaoke_whisper_model", c.karaoke_whisper_model) or "small").strip()
+        lang = str(pick("speech_language_code", c.speech_language_code) or "en-US").strip()
+
+        overlay: Optional[Path] = None
+        if not no_overlay:
+            raw_ov = str(pick("karaoke_overlay_image", c.karaoke_overlay_image) or "").strip()
+            base = cfg_disk.parent.resolve()
+            if raw_ov:
+                ov = Path(raw_ov)
+                resolved_ov = ov.resolve() if ov.is_absolute() else (base / ov).resolve()
+                if resolved_ov.is_file():
+                    overlay = resolved_ov
+            if overlay is None:
+                cand = video_hint.parent / CAPTIONS_STANDALONE_OVERLAY_FALLBACK_NAME
+                overlay = cand if cand.is_file() else None
+
+        return {
+            "config_path_used": cfg_disk,
+            "margin_v_from_top_ratio": margin,
+            "overlay_width_frac": owf,
+            "overlay_margin_bottom_px": omb,
+            "encode_preset": preset,
+            "encode_crf": crf,
+            "karaoke_use_adc": use_adc,
+            "karaoke_whisper_model": wm,
+            "speech_language_code": lang,
+            "overlay_image": overlay,
+            "karaoke_no_overlay": no_overlay,
+        }
 
     def _karaoke_validate_can_run(self, edited_path: Path) -> bool:
         """Return False if karaoke_google / karaoke_vertex prerequisites are missing (Whisper path always OK)."""
@@ -3138,11 +3754,12 @@ class LiveRoundPipeline:
         backend = "whisper" if provider == "karaoke_whisper" else "google"
         if backend != "google":
             return True
+        prefs = self._karaoke_burn_preferences(edited_path)
         cfg_path = self.cfg.pipeline_config_path
         if not cfg_path.is_file():
             print(f"[live] karaoke_google: pipeline config missing ({cfg_path}); skipping karaoke task")
             return False
-        if not self.cfg.karaoke_use_adc and not (self.cfg.speech_api_key or "").strip():
+        if not prefs["karaoke_use_adc"] and not (self.cfg.speech_api_key or "").strip():
             print(
                 "[live] karaoke_google: need speech_api_key (or karaoke_use_adc=true); skipping karaoke task",
                 flush=True,
@@ -3222,12 +3839,14 @@ class LiveRoundPipeline:
 
         backend = "whisper" if provider == "karaoke_whisper" else "google"
 
+        prefs = self._karaoke_burn_preferences(edited_path)
+
         if backend == "google":
             cfg_path = self.cfg.pipeline_config_path
             if not cfg_path.is_file():
                 print(f"[live] karaoke_google: pipeline config missing ({cfg_path}); using portrait-only video")
                 return edited_path
-            if not self.cfg.karaoke_use_adc and not (self.cfg.speech_api_key or "").strip():
+            if not prefs["karaoke_use_adc"] and not (self.cfg.speech_api_key or "").strip():
                 print(
                     "[live] karaoke_google: need speech_api_key (or karaoke_use_adc=true); "
                     "using portrait-only video",
@@ -3240,10 +3859,10 @@ class LiveRoundPipeline:
         work.mkdir(parents=True, exist_ok=True)
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_subprocess.json"
 
-        overlay_resolved = self._resolve_karaoke_overlay_image(edited_path)
+        overlay_resolved = prefs["overlay_image"]
         speech_timeout = float(max(60, self.cfg.speech_recognition_timeout_sec))
         api_key_val: Optional[str]
-        if backend == "google" and not self.cfg.karaoke_use_adc:
+        if backend == "google" and not prefs["karaoke_use_adc"]:
             api_key_val = (self.cfg.speech_api_key or "").strip() or None
         else:
             api_key_val = None
@@ -3254,16 +3873,16 @@ class LiveRoundPipeline:
             "video_out": str(out_pref.resolve()),
             "ffmpeg_bin": self.ffmpeg or "",
             "backend": backend,
-            "whisper_model": self.cfg.karaoke_whisper_model,
-            "language_code": self.cfg.speech_language_code,
+            "whisper_model": str(prefs["karaoke_whisper_model"]),
+            "language_code": str(prefs["speech_language_code"]),
             "timeout_sec": speech_timeout,
             "api_key": api_key_val,
-            "margin_v_from_top_ratio": float(self.cfg.karaoke_margin_top_ratio),
-            "overlay_width_frac": float(self.cfg.karaoke_overlay_width_frac),
-            "overlay_margin_bottom_px": int(self.cfg.karaoke_overlay_margin_bottom_px),
+            "margin_v_from_top_ratio": float(prefs["margin_v_from_top_ratio"]),
+            "overlay_width_frac": float(prefs["overlay_width_frac"]),
+            "overlay_margin_bottom_px": int(prefs["overlay_margin_bottom_px"]),
             "overlay_image": str(overlay_resolved.resolve()) if overlay_resolved else None,
-            "encode_preset": str(self.cfg.karaoke_ffmpeg_preset),
-            "encode_crf": int(self.cfg.karaoke_ffmpeg_crf),
+            "encode_preset": str(prefs["encode_preset"]),
+            "encode_crf": int(prefs["encode_crf"]),
         }
 
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
@@ -3356,13 +3975,23 @@ class LiveRoundPipeline:
         work.mkdir(parents=True, exist_ok=True)
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_vertex_subprocess.json"
 
+        prefs = self._karaoke_burn_preferences(edited_path)
+        if prefs["config_path_used"].resolve() != self.cfg.pipeline_config_path.resolve():
+            print(
+                f"[live] karaoke_vertex: --config {prefs['config_path_used']} "
+                "(CAPTIONS sidecar when present — same overlay/margin/logo as standalone burn_karaoke_captions.py)",
+                flush=True,
+            )
+
         payload: Dict[str, Any] = {
             "captions_script": str(script.resolve()),
-            "pipeline_config": str(self.cfg.pipeline_config_path.resolve()),
+            "pipeline_config": str(prefs["config_path_used"].resolve()),
+            "ffmpeg_bin": str(self.ffmpeg or "").strip(),
             "video_path": str(edited_path.resolve()),
             "work_dir": str(work.resolve()),
             "video_out": str(out_pref.resolve()),
             "karaoke_vertex_roster_path": roster,
+            "karaoke_cli_extras": _vertex_karaoke_argv_from_prefs(prefs),
         }
 
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
@@ -3582,6 +4211,16 @@ class LiveRoundPipeline:
         edited = self._edit_portrait_blur(clip_path, round_number)
         cp_live = self._resolve_caption_provider()
         captioned = self._run_caption_hook(edited)
+        if (
+            cp_live == "karaoke_vertex"
+            and captioned.resolve() == edited.resolve()
+        ):
+            print(
+                "[live] WARN karaoke_vertex: captions were not burned — *_final.mp4 is portrait-only. "
+                "In Docker mount ../CAPTIONS to /app/CAPTIONS (see docker-compose.yml) or set CAPTIONS_BURN_SCRIPT. "
+                f"Burn script path: {_captions_vertex_burn_script_path()}",
+                flush=True,
+            )
         final_video = self._final_video_path(edited, captioned)
         text_pack = self._generate_title_and_seo(analysis, round_number)
         posted = self._post_to_instagram(final_video, text_pack)
@@ -3785,6 +4424,33 @@ class LiveRoundPipeline:
             "round state; stop/split on confirmed next-round scores)",
             flush=True,
         )
+        try:
+            cp = self._resolve_caption_provider()
+            if cp in ("karaoke_whisper", "karaoke_google", "karaoke_vertex"):
+                if self.cfg.karaoke_async:
+                    print(
+                        "[live] Karaoke: async — portrait *_final.mp4 first; captions land in *_karaoke.mp4 / "
+                        "final updated later (HUD capture loop is never blocked).",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[live] Karaoke: synchronous — waits for burn before writing captioned *_final.mp4. "
+                        "This work runs on highlight-queue worker threads only; the main HUD/screenshot loop "
+                        "stays on its own thread so capture is not paused by Vertex/ffmpeg.",
+                        flush=True,
+                    )
+                if cp == "karaoke_vertex":
+                    sp = _captions_vertex_burn_script_path()
+                    ok = sp.is_file()
+                    print(
+                        f"[live] karaoke_vertex script: {sp} (exists={ok}). "
+                        f"If false in Docker, mount CAPTIONS (see docker-compose volumes) or set "
+                        f"CAPTIONS_BURN_SCRIPT / CAPTIONS_KARAOKE_ROOT.",
+                        flush=True,
+                    )
+        except Exception:
+            pass
 
         stop_requested = False
         while not stop_requested:
@@ -3822,7 +4488,25 @@ class LiveRoundPipeline:
                     finished_clip = self._stop_round_recording()
                     self._reset_round_tracking()
                     self._process_or_save_partial_clip(finished_clip, finished_round)
-                print(f"[live] capture/Vision loop error: {exc}")
+                err_text = str(exc)
+                aws_auth_issue = (
+                    "UnrecognizedClientException" in err_text
+                    or "InvalidClientTokenId" in err_text
+                    or "credentials rejected" in err_text.lower()
+                    or "security token included in the request is invalid" in err_text.lower()
+                )
+                now_m = time.monotonic()
+                if aws_auth_issue:
+                    if now_m - self._vision_auth_error_last_emit_monotonic >= 45.0:
+                        self._vision_auth_error_last_emit_monotonic = now_m
+                        print(
+                            "[live] AWS Rekognition auth failing — throttling repeats to every ~45s. "
+                            "Fix credentials then restart (see RuntimeError hints above when raised).",
+                            flush=True,
+                        )
+                        print(f"[live] capture/Vision loop error: {exc}", flush=True)
+                else:
+                    print(f"[live] capture/Vision loop error: {exc}")
             finally:
                 self._stop_screenshot_capture()
 
@@ -3899,12 +4583,15 @@ def _pipeline_builtin_json_defaults() -> Dict[str, Any]:
         "highlight_api_provider": "vertex",
         "highlight_parallel_workers": 2,
         "highlight_yield_to_hud_vision": False,
+        "highlight_vertex_audio_only": False,
         "streamlink_extra_args": [],
         "streamlink_twitch_extra_args": [
             "--twitch-disable-ads",
             "--twitch-disable-reruns",
         ],
         "streamlink_resolve_timeout_sec": 90,
+        # Synchronous karaoke by default so *_final.mp4 has captions (burn runs on highlight workers only).
+        "karaoke_async": False,
     }
 
 
@@ -4045,6 +4732,8 @@ def _load_config(path: Path) -> PipelineConfig:
     hl_yield_raw = cfg.get("highlight_yield_to_hud_vision")
     highlight_yield_to_hud_vision = False if hl_yield_raw is None else bool(hl_yield_raw)
 
+    highlight_vertex_audio_only = bool(cfg.get("highlight_vertex_audio_only", False))
+
     raw_sl_extra = cfg.get("streamlink_extra_args")
     if isinstance(raw_sl_extra, list):
         streamlink_extra_args = [str(x).strip() for x in raw_sl_extra if str(x).strip()]
@@ -4069,6 +4758,7 @@ def _load_config(path: Path) -> PipelineConfig:
         highlight_api_provider=highlight_api_provider,
         highlight_parallel_workers=highlight_parallel_workers,
         highlight_yield_to_hud_vision=highlight_yield_to_hud_vision,
+        highlight_vertex_audio_only=highlight_vertex_audio_only,
         gemini_api_key=gemini_api_keys_val[0] if gemini_api_keys_val else "",
         gemini_api_keys=gemini_api_keys_val,
         gemini_model=cfg.get("gemini_model", "gemini-2.5-flash"),
@@ -4139,7 +4829,7 @@ def _load_config(path: Path) -> PipelineConfig:
         karaoke_use_adc=bool(cfg.get("karaoke_use_adc", False)),
         karaoke_no_overlay=bool(cfg.get("karaoke_no_overlay", False)),
         karaoke_overlay_image=str(cfg.get("karaoke_overlay_image", "") or ""),
-        karaoke_async=bool(cfg.get("karaoke_async", True)),
+        karaoke_async=bool(cfg.get("karaoke_async", False)),
         karaoke_ffmpeg_preset=str(cfg.get("karaoke_ffmpeg_preset", "medium") or "medium"),
         karaoke_ffmpeg_crf=int(cfg.get("karaoke_ffmpeg_crf", 20)),
         karaoke_vertex_roster_path=karaoke_vertex_roster_resolved,
@@ -4230,7 +4920,22 @@ def _bootstrap_ssl_cert_file_from_certifi() -> None:
         print(f"[live] SSL_CERT_FILE set from certifi -> {ca}", flush=True)
 
 
+def _reconfigure_stdio_utf8_best_effort() -> None:
+    """Windows defaults to cp1252; UTF-8 logs avoid UnicodeEncodeError on arrows/em dashes."""
+    if sys.platform != "win32":
+        return
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, TypeError):
+            pass
+
+
 def main() -> int:
+    _reconfigure_stdio_utf8_best_effort()
     parser = argparse.ArgumentParser(description="Live stream CS2 highlight automation pipeline")
     parser.add_argument("--config", required=True, help="Path to JSON config file")
     parser.add_argument(
@@ -4274,7 +4979,12 @@ def main() -> int:
     parser.add_argument(
         "--karaoke-sync",
         action="store_true",
-        help="Wait for karaoke burn before titles/Instagram (overrides karaoke_async in JSON)",
+        help="Wait for karaoke burn before titles/Instagram (sets karaoke_async=false; overrides JSON)",
+    )
+    parser.add_argument(
+        "--karaoke-async",
+        action="store_true",
+        help="Burn karaoke in the background (sets karaoke_async=true; portrait *_final first; overrides JSON)",
     )
     args = parser.parse_args()
 
@@ -4296,8 +5006,12 @@ def main() -> int:
         overrides["caption_provider"] = str(args.caption_provider).strip().lower()
     if args.karaoke_whisper_model is not None:
         overrides["karaoke_whisper_model"] = str(args.karaoke_whisper_model).strip()
+    if args.karaoke_sync and args.karaoke_async:
+        parser.error("use only one of --karaoke-sync and --karaoke-async")
     if args.karaoke_sync:
         overrides["karaoke_async"] = False
+    if args.karaoke_async:
+        overrides["karaoke_async"] = True
     if overrides:
         config = replace(config, **overrides)
         allowed_cp = {
@@ -4317,6 +5031,12 @@ def main() -> int:
         raise ValueError("vertex_api_key / vertex_api_keys required for Vertex AI highlight analysis")
 
     pipeline = LiveRoundPipeline(config)
+    if config.highlight_vertex_audio_only:
+        print(
+            "[live] highlight_vertex_audio_only=true — Vertex receives clip audio + rules_docx text only "
+            "(no equipart JPEG / contact sheet for highlight scoring)",
+            flush=True,
+        )
     pipeline.run_forever()
     return 0
 

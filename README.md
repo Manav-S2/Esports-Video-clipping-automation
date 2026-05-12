@@ -190,6 +190,7 @@ Important config fields:
 - `screenshot_interval_sec`: screenshot cadence for round monitoring. Use `2` for the intended live loop.
 - `round_detection_min_confidence`: Gemini confidence threshold before accepting a detected round.
 - `max_round_jump`: guards against bad HUD reads that jump too many rounds ahead.
+- `highlight_vertex_audio_only`: when `true`, post-round Vertex scoring uses **clip audio + `rules_docx` text only** (semantic match to your Word rules; no JPEG snapshots or contact sheet). When `false`, Vertex gets the default **nine thumbnails + optional audio**.
 - `caption_cmd_template`: optional command hook. It receives `{input}` and `{output}` placeholders and should create the captioned output file.
 - `instagram_enabled`: set to `true` only after local dry-runs look good. Credentials can come from config or `INSTA_USER` / `INSTA_PASS`.
 

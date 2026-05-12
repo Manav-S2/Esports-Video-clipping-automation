@@ -6,6 +6,7 @@
   "highlight_api_provider": "vertex",
   "highlight_parallel_workers": 2,
   "highlight_yield_to_hud_vision": false,
+  "highlight_vertex_audio_only": true,
   "aws_rekognition_region": "us-east-1",
   "gemini_api_key": "",
   "gemini_model": "gemini-2.5-flash",
