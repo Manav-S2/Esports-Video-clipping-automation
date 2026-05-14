@@ -1,5 +1,10 @@
 """Google Cloud Speech-to-Text → SRT / ASS karaoke → ffmpeg burn-in (portrait/clips).
 
+Karaoke timing: word timestamps from Speech follow the **decoded audio** timeline. When burning ASS, ffmpeg
+uses the **video** timeline; if audio and video streams have different ``start_time`` in the MP4, captions
+lag or lead until we apply an ffprobe **audio − video** shift (see ``adjust_speech_words_to_video_timeline``).
+Fine-tune with ``karaoke_caption_time_offset_sec`` in pipeline JSON / ``--karaoke-caption-time-offset-sec``.
+
 Auth (pick one):
 
 - **Application Default Credentials** (recommended when API keys are disabled): install
@@ -8,8 +13,8 @@ Auth (pick one):
   and ``burn_karaoke_captions.py --use-adc``.
 
 - **API key** (REST ``speech:recognize``): set ``speech_api_key`` in config or env
-  ``GOOGLE_SPEECH_API_KEY``. Works only when your GCP project allows API keys on Speech-to-Text and the
-  clip is under ~1 minute (synchronous recognition). Long-running Speech RPCs typically require OAuth.
+  ``GOOGLE_SPEECH_API_KEY``. Clips up to ~58 s use one REST call; longer clips use **automatic ~52 s**
+  ffmpeg chunking against the same key. LRO without chunked REST uses ADC + ``google-cloud-speech``.
 
 Enable the Cloud Speech-to-Text API on the GCP project you authenticate against.
 """
@@ -25,6 +30,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -178,23 +184,107 @@ def _speech_rest_sync_recognize(
         raise RuntimeError(f"Speech API recognize failed: HTTP {exc.code} {err_body}") from exc
 
 
+_CHUNK_SYNC_MAX_SEC = 52.0
+
+
+def _ffmpeg_trim_wav_segment(
+    ffmpeg_bin: str, src_wav: Path, dst_wav: Path, start_sec: float, duration_sec: float
+) -> None:
+    """Extract [start_sec, start_sec+duration_sec) re-encoded as mono 16 kHz LINEAR16 WAV."""
+    dst_wav.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-ss",
+        f"{max(0.0, start_sec):.3f}",
+        "-t",
+        f"{max(0.1, duration_sec):.3f}",
+        "-i",
+        str(src_wav.resolve()),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(dst_wav.resolve()),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg WAV segment extract failed\n" + (proc.stderr or proc.stdout or "")[-6000:]
+        )
+
+
+def _transcribe_wav_rest_chunked_api_key(
+    wav_path: Path,
+    api_key: str,
+    language_code: str,
+    ffmpeg_bin: str,
+    total_duration_sec: float,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Synchronous Speech REST (~52s chunks) when clip exceeds API-key single-request limit (~1 minute)."""
+    all_words: List[Dict[str, Any]] = []
+    transcript_chunks: List[str] = []
+    t = 0.0
+    idx = 0
+    tmpdir = tempfile.mkdtemp(prefix="speech_api_chunk_")
+    try:
+        while t < total_duration_sec - 1e-3:
+            seg_dur = min(_CHUNK_SYNC_MAX_SEC, max(0.2, total_duration_sec - t))
+            chunk_path = Path(tmpdir) / f"c_{idx:04d}.wav"
+            _ffmpeg_trim_wav_segment(ffmpeg_bin, wav_path, chunk_path, t, seg_dur)
+            chunk_bytes = chunk_path.read_bytes()
+            resp = _speech_rest_sync_recognize(chunk_bytes, api_key.strip(), language_code)
+            words, tr = _json_results_to_words_and_transcript(resp)
+            for w in words:
+                all_words.append(
+                    {
+                        "word": str(w.get("word", "") or ""),
+                        "start": float(w.get("start", 0.0)) + t,
+                        "end": float(w.get("end", 0.0)) + t,
+                    }
+                )
+            if tr.strip():
+                transcript_chunks.append(tr.strip())
+            t += seg_dur
+            idx += 1
+            if idx > 500:
+                raise RuntimeError("Speech chunk transcription: exceeded iteration safety limit")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    all_words.sort(key=lambda x: float(x.get("start", 0.0)))
+    transcript = " ".join(transcript_chunks).strip()
+    if not all_words and transcript:
+        all_words = [
+            {"word": transcript, "start": 0.0, "end": max(2.0, len(transcript) * 0.08)},
+        ]
+    return all_words, transcript
+
+
 def transcribe_google_long_wav(
     wav_path: Path,
     *,
     language_code: str = "en-US",
     timeout_sec: float = 600.0,
     api_key: Optional[str] = None,
+    ffmpeg_bin: Optional[str] = None,
     client_factory: Optional[Callable[[], Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
     """Long-running recognition on WAV bytes; returns word dicts and full transcript.
 
     Each word dict: ``{"word": str, "start": float, "end": float}``.
 
-    If ``api_key`` is set, uses REST + API key: synchronous ``speech:recognize`` for clips
-    up to ~58 seconds (Google limit ~1 minute). Longer audio requires Application Default
-    Credentials + ``google-cloud-speech`` (``api_key=None``).
+    If ``api_key`` is set, uses REST + synchronous ``speech:recognize`` for clips up to ~58 seconds.
+    Longer clips use **chunked** sync requests (~52 s segments via ffmpeg trim) unless you use ADC
+    (``api_key=None``) with ``google-cloud-speech`` LRO.
 
     With no API key, uses ``google.cloud.speech`` + Application Default Credentials (LRO).
+
+    ``ffmpeg_bin``: required on PATH (or explicit path) when using API key + duration > ~58 s chunking.
     """
     wav_bytes = wav_path.read_bytes()
     limit = 10 * 1024 * 1024  # inline async limit (~10 MiB)
@@ -210,12 +300,18 @@ def transcribe_google_long_wav(
         if duration_sec <= 58.0:
             response = _speech_rest_sync_recognize(wav_bytes, key, language_code)
             return _json_results_to_words_and_transcript(response)
-        raise RuntimeError(
-            f"Clip audio is ~{duration_sec:.1f}s; Google Speech REST with an API key only supports "
-            "synchronous recognition for audio up to ~1 minute, and long-running recognition does not "
-            "accept API keys. Install google-cloud-speech, use ``api_key=None`` / ``--use-adc``, and set "
-            "``GOOGLE_APPLICATION_CREDENTIALS`` (or run ``gcloud auth application-default login``)."
+        ff = (ffmpeg_bin or "").strip() or shutil.which("ffmpeg") or ""
+        if not ff:
+            raise RuntimeError(
+                f"Clip audio is ~{duration_sec:.1f}s; chunked API-key Speech needs ffmpeg on PATH "
+                "(or pass ffmpeg_bin)."
+            )
+        print(
+            f"[speech] Clip ~{duration_sec:.1f}s exceeds REST sync (~58s); "
+            f"chunked transcription ({_CHUNK_SYNC_MAX_SEC:.0f}s windows, ffmpeg)",
+            flush=True,
         )
+        return _transcribe_wav_rest_chunked_api_key(wav_path, key, language_code, ff, duration_sec)
 
     try:
         from google.cloud import speech_v1 as speech  # type: ignore
@@ -574,6 +670,140 @@ def probe_video_dimensions(video_path: Path, ffmpeg_bin: str) -> Tuple[int, int]
     return int(parts[0]), int(parts[1])
 
 
+def _resolve_ffprobe_bin_from_ffmpeg(ffmpeg_bin: str) -> str:
+    cand = Path(ffmpeg_bin)
+    w = shutil.which("ffprobe")
+    if w:
+        return w
+    for name in ("ffprobe.exe", "ffprobe"):
+        alt = cand.parent / name
+        if alt.is_file():
+            return str(alt)
+    raise RuntimeError(
+        "ffprobe not found (install FFmpeg with ffprobe or keep ffprobe beside ffmpeg)."
+    )
+
+
+def ffprobe_demuxer_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
+    probe = _resolve_ffprobe_bin_from_ffmpeg(ffmpeg_bin)
+    cmd = [
+        probe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path.resolve()),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return 0.0
+    try:
+        return max(0.0, float((proc.stdout or "").strip()))
+    except ValueError:
+        return 0.0
+
+
+def _ffprobe_stream_start_sec(media_path: Path, ffmpeg_bin: str, selector: str) -> Optional[float]:
+    probe = _resolve_ffprobe_bin_from_ffmpeg(ffmpeg_bin)
+    cmd = [
+        probe,
+        "-v",
+        "error",
+        "-select_streams",
+        selector,
+        "-show_entries",
+        "stream=start_time",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(media_path.resolve()),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        return float(lines[0])
+    except ValueError:
+        return None
+
+
+def _clamp_words_duration_to_clip(words: List[Dict[str, Any]], dur: float) -> List[Dict[str, Any]]:
+    if dur <= 0:
+        return words
+    out: List[Dict[str, Any]] = []
+    for w in words:
+        try:
+            s = float(w.get("start", 0.0))
+        except (TypeError, ValueError):
+            s = 0.0
+        try:
+            e = float(w.get("end", s))
+        except (TypeError, ValueError):
+            e = s
+        s = max(0.0, min(s, dur))
+        e = max(s, min(e, dur))
+        out.append({"word": str(w.get("word", "") or ""), "start": s, "end": e})
+    return out
+
+
+def adjust_speech_words_to_video_timeline(
+    words: List[Dict[str, Any]],
+    *,
+    video_path: Path,
+    ffmpeg_bin: str,
+    clip_duration_sec: float,
+    manual_offset_sec: float = 0.0,
+    apply_mux_av_correction: bool = True,
+    invert_mux_delta: bool = False,
+) -> List[Dict[str, Any]]:
+    """Align Cloud Speech timestamps (decoded-audio-relative) with the video timeline ffmpeg uses when burning ASS.
+
+    MP4 clips often mux audio slightly after video PTS; subtitles must be shifted by
+    ffprobe(audio.start_time − video.start_time) plus optional ``manual_offset_sec`` (negative = earlier captions).
+    """
+    if not words:
+        return words
+    off = float(manual_offset_sec or 0.0)
+    if apply_mux_av_correction and clip_duration_sec > 0:
+        a_start = _ffprobe_stream_start_sec(video_path, ffmpeg_bin, "a:0")
+        v_start = _ffprobe_stream_start_sec(video_path, ffmpeg_bin, "v:0")
+        if a_start is not None or v_start is not None:
+            a0 = float(a_start if a_start is not None else 0.0)
+            v0 = float(v_start if v_start is not None else 0.0)
+            mux_delta = a0 - v0
+            if invert_mux_delta:
+                mux_delta = -mux_delta
+            if mux_delta > 2.5 or mux_delta < -2.5:
+                print(
+                    f"[speech] WARN: A/V mux start delta {mux_delta:.4f}s is large; clamping to +-2.5s",
+                    flush=True,
+                )
+                mux_delta = max(-2.5, min(2.5, mux_delta))
+            if abs(mux_delta) >= 0.005:
+                label = " (inverted)" if invert_mux_delta else ""
+                print(
+                    "[speech] Karaoke timing: adjusting word timestamps by "
+                    f"{mux_delta:+.4f}s (audio minus video stream start_time){label}",
+                    flush=True,
+                )
+                off += mux_delta
+    if abs(off) < 1e-6:
+        return _clamp_words_duration_to_clip(words, clip_duration_sec)
+    shifted = [
+        {
+            "word": str(w.get("word") or ""),
+            "start": float(w.get("start", 0.0)) + off,
+            "end": float(w.get("end", 0.0)) + off,
+        }
+        for w in words
+    ]
+    return _clamp_words_duration_to_clip(shifted, clip_duration_sec)
+
+
 def _ass_ts(seconds: float) -> str:
     """ASS ``H:MM:SS.cc`` from seconds (centisecond precision)."""
     if math.isnan(seconds) or seconds < 0:
@@ -830,6 +1060,7 @@ def transcribe_and_burn(
         language_code=language_code,
         timeout_sec=timeout_sec,
         api_key=api_key,
+        ffmpeg_bin=ffmpeg_bin,
     )
     srt_body = words_to_srt(words)
     if not srt_body.strip():
@@ -861,8 +1092,6 @@ def transcribe_and_burn_karaoke(
     video_out: Path,
     ffmpeg_bin: str,
     *,
-    backend: str = "whisper",
-    whisper_model: str = "small",
     language_code: str = "en-US",
     timeout_sec: float = 600.0,
     api_key: Optional[str] = None,
@@ -877,10 +1106,17 @@ def transcribe_and_burn_karaoke(
     karaoke_uppercase_words: bool = True,
     encode_preset: str = "medium",
     encode_crf: int = 20,
+    karaoke_caption_time_offset_sec: float = 0.0,
+    karaoke_disable_av_mux_timing_fix: bool = False,
+    karaoke_invert_mux_timing_fix: bool = False,
 ) -> Dict[str, Any]:
-    """Extract WAV → Speech-to-Text → ASS karaoke → burned MP4 (top-centered highlight).
+    """Extract WAV → Cloud Speech-to-Text → ASS karaoke → burned MP4 (top-centered highlight).
 
-    ``backend``: ``\"google\"`` (Cloud Speech + API key / ADC) or ``\"whisper\"`` (local OpenAI Whisper).
+    Requires Google Speech (API key and/or Application Default Credentials) as documented in this module docstring.
+
+    Word timestamps from Speech describe the decoded audio timeline. Before burning ASS onto the muxed MP4 we
+    apply an ffprobe **audio − video ``start_time``** shift (same principle as Vertex MP3 captions) unless
+    ``karaoke_disable_av_mux_timing_fix`` is true.
 
     Optional ``overlay_image``: composite branding PNG/JPEG centered near the bottom after subtitles.
 
@@ -895,47 +1131,49 @@ def transcribe_and_burn_karaoke(
 
     extract_linear16_wav_mono16k(video_path, ffmpeg_bin, wav)
 
-    backend_norm = (backend or "whisper").strip().lower()
-    if backend_norm == "whisper":
-        from speech_whisper_captions import normalize_language_for_whisper, transcribe_whisper_wav
-
-        wl = normalize_language_for_whisper(language_code)
-        words, transcript = transcribe_whisper_wav(wav, model_size=whisper_model, language=wl)
-        speech_auth = f"whisper:{whisper_model}"
-    elif backend_norm == "google":
-        try:
+    try:
+        words, transcript = transcribe_google_long_wav(
+            wav,
+            language_code=language_code,
+            timeout_sec=timeout_sec,
+            api_key=api_key,
+            ffmpeg_bin=ffmpeg_bin,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        used_key = (api_key or "").strip()
+        if used_key and (
+            "401" in msg
+            or "API keys are not supported" in msg
+            or "UNAUTHENTICATED" in msg
+            or "CREDENTIALS_MISSING" in msg
+        ):
+            print(
+                "[speech] REST Speech failed with API key; retrying with Application Default Credentials "
+                "(``google-cloud-speech`` + ``GOOGLE_APPLICATION_CREDENTIALS`` or "
+                "``gcloud auth application-default login``).",
+                flush=True,
+            )
             words, transcript = transcribe_google_long_wav(
                 wav,
                 language_code=language_code,
                 timeout_sec=timeout_sec,
-                api_key=api_key,
+                api_key=None,
             )
-        except RuntimeError as exc:
-            msg = str(exc)
-            used_key = (api_key or "").strip()
-            if used_key and (
-                "401" in msg
-                or "API keys are not supported" in msg
-                or "UNAUTHENTICATED" in msg
-                or "CREDENTIALS_MISSING" in msg
-            ):
-                print(
-                    "[speech] REST Speech failed with API key; retrying with Application Default Credentials "
-                    "(``google-cloud-speech`` + ``GOOGLE_APPLICATION_CREDENTIALS`` or "
-                    "``gcloud auth application-default login``).",
-                    flush=True,
-                )
-                words, transcript = transcribe_google_long_wav(
-                    wav,
-                    language_code=language_code,
-                    timeout_sec=timeout_sec,
-                    api_key=None,
-                )
-            else:
-                raise
-        speech_auth = "api_key" if (api_key or "").strip() else "adc"
-    else:
-        raise ValueError(f"Unknown karaoke backend {backend!r}; use \"google\" or \"whisper\".")
+        else:
+            raise
+    speech_auth = "api_key" if (api_key or "").strip() else "adc"
+
+    dur = ffprobe_demuxer_duration_sec(video_path, ffmpeg_bin)
+    words = adjust_speech_words_to_video_timeline(
+        words,
+        video_path=video_path,
+        ffmpeg_bin=ffmpeg_bin,
+        clip_duration_sec=dur,
+        manual_offset_sec=float(karaoke_caption_time_offset_sec),
+        apply_mux_av_correction=not karaoke_disable_av_mux_timing_fix,
+        invert_mux_delta=bool(karaoke_invert_mux_timing_fix),
+    )
 
     ass_body = words_to_ass_karaoke(
         words,
@@ -1025,7 +1263,7 @@ def transcribe_and_burn_karaoke(
         "word_count": len(words),
         "ass_path": str(ass_path),
         "speech_auth": speech_auth,
-        "backend": backend_norm,
+        "backend": "google",
         "play_res": [play_x, play_y],
         "overlay_image": str(overlay_resolved) if overlay_resolved and overlay_resolved.is_file() else "",
         "video_out": str(out_mp4.resolve()),

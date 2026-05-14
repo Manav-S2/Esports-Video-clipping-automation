@@ -40,41 +40,14 @@ RUN set -eux; \
 WORKDIR /app
 
 COPY requirements.txt .
-# Whisper pulls torch; split installs so retries/cache skip finished layers. ``IncompleteRead`` / ``ProtocolError``
-# mid-download = flaky VPN/Wi‑Fi/firewall or CDN reset — retry ``docker compose build``; ease load with wired/stable net.
-RUN grep -vE '^[[:space:]]*#|^[[:space:]]*openai-whisper' requirements.txt | grep -v '^[[:space:]]*$' > /tmp/req-nowhisper.txt
-
-RUN pip install --upgrade pip setuptools wheel
-
+# ``IncompleteRead`` / ``ProtocolError`` mid-download = flaky VPN/Wi‑Fi/firewall or CDN reset — retry ``docker compose build``.
 RUN set -eu; \
     for n in 1 2 3 4 5 6; do \
-        if pip install --retries 25 -r /tmp/req-nowhisper.txt; then \
+        if pip install --upgrade pip setuptools wheel \
+            && pip install --retries 25 -r requirements.txt; then \
             exit 0; \
         fi; \
         echo "PyPI deps failed (attempt $n), retrying in $((n * 10))s..." >&2; \
-        sleep $((n * 10)); \
-    done; \
-    exit 1
-
-# CPU wheels are large; extra shell retries help when the TCP stream dies partway through.
-RUN set -eu; \
-    for n in 1 2 3 4 5 6; do \
-        if pip install --retries 25 torch torchaudio --index-url https://download.pytorch.org/whl/cpu; then \
-            exit 0; \
-        fi; \
-        echo "torch install failed (attempt $n), retrying in $((n * 10))s..." >&2; \
-        sleep $((n * 10)); \
-    done; \
-    exit 1
-
-RUN set -eu; \
-    for n in 1 2 3 4 5 6; do \
-        if pip install --retries 25 "$(grep '^openai-whisper' requirements.txt | head -1)" \
-            && pip install --retries 25 torch torchaudio --index-url https://download.pytorch.org/whl/cpu --force-reinstall --no-deps; \
-        then \
-            exit 0; \
-        fi; \
-        echo "whisper/torch pin failed (attempt $n), retrying in $((n * 10))s..." >&2; \
         sleep $((n * 10)); \
     done; \
     exit 1

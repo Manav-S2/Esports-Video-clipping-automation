@@ -26,7 +26,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import warnings
 
@@ -1372,8 +1372,7 @@ def _interactive_session_configure(cfg: PipelineConfig, *, stream_url_from_cli: 
         cfg,
         stream_url=url,
         stream_input_seek_sec=float(max(0.0, seek_sec)),
-        caption_provider="karaoke_vertex",
-        karaoke_vertex_roster_path=str(roster_out),
+        caption_provider="karaoke_google",
     )
 
 
@@ -1708,7 +1707,7 @@ class PipelineConfig:
     round_roi_h: float
     caption_cmd_template: str
     caption_hook_timeout_sec: int
-    caption_provider: str  # auto | none | google_speech | shell | karaoke_whisper | karaoke_google | karaoke_vertex
+    caption_provider: str  # auto | none | google_speech | shell | karaoke_google | karaoke_vertex
     speech_language_code: str
     speech_recognition_timeout_sec: int
     speech_api_key: str  # optional; prefer env GOOGLE_SPEECH_API_KEY
@@ -1722,7 +1721,6 @@ class PipelineConfig:
     # Absolute path to the pipeline JSON (Google Speech key resolution for karaoke_google).
     pipeline_config_path: Path
     # Karaoke ASS + optional bottom PNG overlay via isolated child process (``multiprocessing`` spawn).
-    karaoke_whisper_model: str
     karaoke_margin_top_ratio: float
     karaoke_overlay_width_frac: float
     karaoke_overlay_margin_bottom_px: int
@@ -1746,9 +1744,9 @@ class PipelineConfig:
 
 
 def _vertex_karaoke_argv_from_prefs(prefs: Dict[str, Any]) -> List[str]:
-    """CLI flags aligned with ``CAPTIONS/burn_karaoke_captions.py`` ``_inject_pipeline_karaoke_defaults`` (Vertex mode).
+    """CLI flags for CAPTIONS ``burn_karaoke_captions.py`` **Vertex** mode (not Esports delegate).
 
-    Ensures margin / overlay / encode match standalone burns even when the JSON on disk is minimal.
+    Matches margin, overlay layout, Vertex limits/GCS/roster/time-offset knobs from pipeline prefs JSON.
     """
     out: List[str] = []
     lang = str(prefs.get("speech_language_code") or "").strip()
@@ -1767,14 +1765,34 @@ def _vertex_karaoke_argv_from_prefs(prefs: Dict[str, Any]) -> List[str]:
         ov = prefs.get("overlay_image")
         if isinstance(ov, Path) and ov.is_file():
             out += ["--overlay-image", str(ov.resolve())]
+    vmx = prefs.get("karaoke_vertex_inline_video_max_mb")
+    if vmx is not None:
+        try:
+            fv = float(vmx)
+            if fv > 0:
+                out += ["--vertex-inline-video-max-mb", str(fv)]
+        except (TypeError, ValueError):
+            pass
+    if prefs.get("karaoke_vertex_send_full_video"):
+        out.append("--vertex-send-full-video")
+    if prefs.get("karaoke_vertex_audio_only"):
+        out.append("--vertex-audio-only")
+    v_au = prefs.get("vertex_audio_gcs_uri")
+    if isinstance(v_au, str) and v_au.strip():
+        out += ["--vertex-audio-gcs-uri", v_au.strip()]
+    ko = prefs.get("karaoke_caption_time_offset_sec")
+    if ko is not None:
+        try:
+            out += ["--karaoke-caption-time-offset-sec", str(float(ko))]
+        except (TypeError, ValueError):
+            pass
+    if prefs.get("karaoke_vertex_invert_mux_timing_fix"):
+        out.append("--vertex-invert-mux-timing")
     return out
 
 
 def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
-    """Spawn CAPTIONS ``burn_karaoke_captions.py`` (Vertex Gemini video karaoke)."""
-    import subprocess
-    import sys
-
+    """Spawn CAPTIONS ``burn_karaoke_captions.py`` (Vertex Gemini karaoke; video when under cap, else MP3)."""
     script = Path(payload["captions_script"])
     roster = str(payload.get("karaoke_vertex_roster_path") or "").strip()
     cmd: List[str] = [sys.executable, str(script)]
@@ -1806,42 +1824,40 @@ def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
     raise SystemExit(code)
 
 
-def _karaoke_burn_child_main(payload: Dict[str, Any]) -> None:
-    """Run ``transcribe_and_burn_karaoke`` in a spawned interpreter (isolates Whisper/GPU load).
+def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
+    """Same entry as standalone ``CAPTIONS/burn_karaoke_captions.py --delegate-esports-karaoke`` → Esports Speech burn."""
 
-    Module-level entry point required for ``multiprocessing`` spawn on Windows.
-    """
-    from pathlib import Path
+    caps_script = Path(payload["captions_script"]).resolve()
+    cmd: List[str] = [
+        sys.executable,
+        str(caps_script),
+        "--delegate-esports-karaoke",
+        "--config",
+        str(Path(payload["pipeline_config"]).resolve()),
+        "--video",
+        str(Path(payload["video_path"]).resolve()),
+        "--output",
+        str(Path(payload["video_out"]).resolve()),
+    ]
+    ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
+    if ffmpeg_bin:
+        cmd += ["--ffmpeg", ffmpeg_bin]
 
-    from speech_google_captions import transcribe_and_burn_karaoke
-
-    overlay_raw = payload.get("overlay_image")
-    overlay_image = Path(overlay_raw).resolve() if overlay_raw else None
-
-    api_raw = payload.get("api_key")
-    api_key = str(api_raw).strip() if api_raw else None
-
-    transcribe_and_burn_karaoke(
-        Path(payload["video_path"]),
-        Path(payload["work_dir"]),
-        Path(payload["video_out"]),
-        str(payload["ffmpeg_bin"]),
-        backend=str(payload["backend"]),
-        whisper_model=str(payload["whisper_model"]),
-        language_code=str(payload["language_code"]),
-        timeout_sec=float(payload["timeout_sec"]),
-        api_key=api_key,
-        margin_v_from_top_ratio=float(payload["margin_v_from_top_ratio"]),
-        overlay_image=overlay_image,
-        overlay_width_frac=float(payload["overlay_width_frac"]),
-        overlay_margin_bottom_px=int(payload["overlay_margin_bottom_px"]),
-        encode_preset=str(payload.get("encode_preset") or "medium"),
-        encode_crf=int(payload.get("encode_crf", 20)),
+    low = _subprocess_creationflags_low_priority()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(caps_script.parent),
+        **({"creationflags": low} if low else {}),
     )
+    code = proc.returncode if proc.returncode is not None else 1
+    raise SystemExit(code)
 
 
 class LiveRoundPipeline:
-    def __init__(self, config: PipelineConfig):
+    def __init__(self, config: PipelineConfig, *, init_mode: str = "live"):
+        if init_mode not in ("live", "captions_batch"):
+            raise ValueError(f"init_mode must be 'live' or 'captions_batch', not {init_mode!r}")
+
         self.cfg = config
 
         # Gemini is called via REST so the local Python environment does not need google-genai installed.
@@ -1849,6 +1865,10 @@ class LiveRoundPipeline:
         self.ffmpeg = shutil.which("ffmpeg")
         if not self.ffmpeg:
             raise RuntimeError("ffmpeg not found in PATH.")
+
+        if init_mode == "captions_batch":
+            self._init_captions_batch_mode()
+            return
 
         self.root = Path(config.output_root).resolve()
         self.screen_dir = self.root / "screens"
@@ -1901,26 +1921,26 @@ class LiveRoundPipeline:
             if eff == "shell":
                 print("[live] caption_provider=auto -> shell caption_cmd_template", flush=True)
             elif eff == "google_speech":
-                print("[live] caption_provider=auto -> Google Speech captions (API key configured)", flush=True)
-            elif eff == "karaoke_vertex":
+                print("[live] caption_provider=auto -> Google Speech captions (simple burn API)", flush=True)
+            elif eff == "karaoke_google":
                 async_note = "async (titles/post don't wait)" if self.cfg.karaoke_async else "blocking"
                 print(
-                    f"[live] caption_provider=auto -> karaoke_vertex ({async_note}; Vertex + CAPTIONS burn script)",
+                    f"[live] caption_provider=auto -> karaoke_google ({async_note}; Cloud Speech-to-Text karaoke)",
                     flush=True,
                 )
             else:
                 print(
-                    "[live] caption_provider=auto -> no Speech key / no shell template / "
-                    "no usable Vertex karaoke stack (captions off)",
+                    "[live] caption_provider=auto -> no Speech credentials / no shell template / "
+                    "CAPTIONS router missing (captions off)",
                     flush=True,
                 )
         elif cp_raw == "none":
             print("[live] caption_provider=none (captions disabled)", flush=True)
-        elif cp_raw in ("karaoke_whisper", "karaoke_google"):
+        elif cp_raw == "karaoke_google":
             async_note = "async (titles/post don't wait)" if self.cfg.karaoke_async else "blocking"
             print(
-                f"[live] caption_provider={cp_raw} -> karaoke via multiprocessing child "
-                f"({async_note}; transcribe_and_burn_karaoke)",
+                f"[live] caption_provider=karaoke_google -> CAPTIONS burn_karaoke_captions.py --delegate-esports-karaoke "
+                f"→ Esports Speech burn ({async_note})",
                 flush=True,
             )
         elif cp_raw == "karaoke_vertex":
@@ -1963,6 +1983,378 @@ class LiveRoundPipeline:
         self._hud_remote_calls_active = 0
         self._record_suspended_for_hud_idle = False
         self._vision_auth_error_last_emit_monotonic: float = 0.0
+
+    def _init_captions_batch_mode(self) -> None:
+        """Minimal dirs + worker state for ``--captions-batch-only`` (no capture, HUD, demo, highlights)."""
+        self.root = Path(self.cfg.output_root).resolve()
+        self.screen_dir = self.root / "screens"
+        self.raw_dir = self.root / "round_raw"
+        self.edit_dir = self.root / "round_edited"
+        self.final_dir = self.root / "round_final"
+        self.meta_dir = self.root / "meta"
+        for p in (self.root, self.edit_dir, self.final_dir, self.meta_dir):
+            _ensure_dir(p)
+
+        self.demo_path = Path(self.cfg.demo_file).expanduser().resolve()
+        self.rules_docx_path = None
+        self.rules_text = ""
+        self.round_context_text = ""
+
+        print(
+            "[live] captions-batch-only: skipping live stream, Rekognition HUD, demo/rules load, highlights; "
+            f"reading {self.edit_dir} (+ optional ``round_final/*_portrait_final.mp4`` staged); writing karaoke + *_final.mp4 under {self.final_dir}",
+            flush=True,
+        )
+        prov_resolved = self._resolve_caption_provider()
+        vtx_script = _captions_vertex_burn_script_path()
+        print(
+            f"[live] captions-batch resolved_provider={prov_resolved}; "
+            f"CAPTIONS burn script exists={vtx_script.is_file()} → {vtx_script}",
+            flush=True,
+        )
+
+        self.state_file = self.meta_dir / "round_state.json"
+        self.detection_log_file = self.meta_dir / "round_detections.jsonl"
+
+        self.current_round: Optional[int] = None
+        self.record_proc: Optional[subprocess.Popen[str]] = None
+        self.record_round: Optional[int] = None
+        self.record_started_at: float = 0.0
+        self.record_path: Optional[Path] = None
+        self.record_log_path: Optional[Path] = None
+        self.screenshot_proc: Optional[subprocess.Popen[str]] = None
+        self.screenshot_log_path: Optional[Path] = None
+        self._resolved_input_url: str = ""
+        self._resolved_at: float = 0.0
+        self._vod_playback_anchor_monotonic: float = 0.0
+        self._logged_vod_recording_re: bool = False
+        self._arm_round: Optional[int] = None
+        self._arm_same_count: int = 0
+        self._pending_transition_to: Optional[int] = None
+        self._pending_transition_count: int = 0
+        self._gemini_key_index: int = 0
+        self._vertex_key_index: int = 0
+        self._highlight_queue: queue.Queue[tuple[Path, int]] = queue.Queue()
+        self._highlight_workers_started = 0
+        self._highlight_worker_lock = threading.Lock()
+        self._vision_coord_cv = threading.Condition(threading.Lock())
+        self._hud_remote_calls_active = 0
+        self._record_suspended_for_hud_idle = False
+        self._vision_auth_error_last_emit_monotonic: float = 0.0
+
+    @staticmethod
+    def _caption_batch_dedupe_key(stem: str) -> str:
+        """Normalize filename stem so ``foo_portrait`` and ``foo_portrait_final`` dedupe."""
+        stem_l = stem.lower()
+        suf = "_final"
+        if stem_l.endswith(suf):
+            stem = stem[: len(stem) - len(suf)]
+        return stem.lower()
+
+    def _caption_batch_repair_mp4_inplace(self, path: Path, *, source_hint: str) -> None:
+        """Try stream-copy remux when ffprobe cannot read a staged MP4 (e.g. missing moov due to truncate)."""
+        if _ffprobe_duration_sec(path, self.ffmpeg) is not None:
+            return
+        ffmpeg_bin = (self.ffmpeg or "").strip() or shutil.which("ffmpeg") or ""
+        if not ffmpeg_bin:
+            print(
+                f"[live] captions-batch WARN: ffprobe failed on {path.name} and ffmpeg not found; "
+                f"source={source_hint}",
+                flush=True,
+            )
+            return
+        tmp = path.parent / f"{path.stem}__moovrepair{path.suffix}"
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+genpts",
+            "-i",
+            str(path),
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            tmp.unlink(missing_ok=True)
+            print(
+                f"[live] captions-batch WARN: remux aborted for staged {path.name}: {exc}; "
+                f"source={source_hint}",
+                flush=True,
+            )
+            return
+        if proc.returncode != 0:
+            tail = ((proc.stderr or "") + (proc.stdout or ""))[-800:]
+            tmp.unlink(missing_ok=True)
+            print(
+                f"[live] captions-batch WARN: remux failed (code {proc.returncode}) for {path.name}; "
+                f"source={source_hint}\n{tail}",
+                flush=True,
+            )
+            return
+        if _ffprobe_duration_sec(tmp, self.ffmpeg) is None:
+            tmp.unlink(missing_ok=True)
+            print(
+                f"[live] captions-batch WARN: ffprobe still failed after remux for {path.name}; "
+                f"source={source_hint}",
+                flush=True,
+            )
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            tmp.unlink(missing_ok=True)
+            print(
+                f"[live] captions-batch WARN: could not unlink broken {path.name}: {exc}; "
+                f"source={source_hint}",
+                flush=True,
+            )
+            return
+        try:
+            tmp.rename(path)
+        except OSError:
+            try:
+                shutil.move(str(tmp), str(path))
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                print(
+                    f"[live] captions-batch WARN: could not move remux to {path.name}: {exc}; "
+                    f"source={source_hint}",
+                    flush=True,
+                )
+                return
+        print(
+            f"[live] captions-batch: remux repaired unreadable staged file → {path.name} "
+            f"(from {source_hint})",
+            flush=True,
+        )
+
+    def _caption_batch_gather_inputs(self, sources: FrozenSet[str]) -> tuple[List[Path], List[Path]]:
+        """Build ordered caption inputs and ephemeral staged files to delete afterward.
+
+        * ``edited`` — ``*_portrait.mp4`` plus other ``*.mp4`` excluding karaoke/captioned/final artefacts.
+        * ``final`` — ``*_portrait_final.mp4`` portrait-only finals copied under ``meta/captions_batch_stage/``
+          with stem ``*_portrait`` so karaoke output names match ``live`` runs.
+
+        Duplicate logical clips dedupe ``edited`` over ``final``.
+        """
+        work: List[Path] = []
+        staged_cleanup: List[Path] = []
+        seen_keys: set[str] = set()
+
+        def try_add(path: Path) -> None:
+            key = self._caption_batch_dedupe_key(path.stem)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            work.append(path)
+
+        if "edited" in sources and self.edit_dir.is_dir():
+            primary = sorted(self.edit_dir.glob("*_portrait.mp4"))
+            resolved_already: set[Path] = set()
+            for p in primary:
+                self._caption_batch_repair_mp4_inplace(p, source_hint=p.name)
+                if _ffprobe_duration_sec(p, self.ffmpeg) is None:
+                    print(
+                        f"[live] captions-batch: skip {p.name} in round_edited — unreadable MP4 (fix or replace).",
+                        flush=True,
+                    )
+                    continue
+                try_add(p)
+                resolved_already.add(p.resolve())
+            for p in sorted(self.edit_dir.glob("*.mp4")):
+                st_l = p.stem.lower()
+                if "_karaoke" in st_l or "captioned" in st_l:
+                    continue
+                if st_l.endswith("_final"):
+                    continue
+                try:
+                    if p.resolve() in resolved_already:
+                        continue
+                except OSError:
+                    continue
+                self._caption_batch_repair_mp4_inplace(p, source_hint=p.name)
+                if _ffprobe_duration_sec(p, self.ffmpeg) is None:
+                    print(
+                        f"[live] captions-batch: skip {p.name} in round_edited — unreadable MP4 (fix or replace).",
+                        flush=True,
+                    )
+                    continue
+                try_add(p)
+                resolved_already.add(p.resolve())
+
+        if "final" in sources and self.final_dir.is_dir():
+            stage_root = self.meta_dir / "captions_batch_stage"
+            stage_root.mkdir(parents=True, exist_ok=True)
+            for fp in sorted(self.final_dir.glob("*_portrait_final.mp4")):
+                st = fp.stem
+                st_l = st.lower()
+                if not st_l.endswith("_portrait_final"):
+                    continue
+                base = st[: len(st) - len("_final")]
+                key = base.lower()
+                if key in seen_keys:
+                    continue
+                staged = stage_root / f"{base}.mp4"
+                try:
+                    shutil.copy2(fp, staged)
+                    now = time.time()
+                    os.utime(staged, (now, now))
+                    self._caption_batch_repair_mp4_inplace(staged, source_hint=fp.name)
+                    if _ffprobe_duration_sec(staged, self.ffmpeg) is None:
+                        print(
+                            f"[live] captions-batch: skip {fp.name} — MP4 unreadable (moov missing / corrupt). "
+                            f"Fix or replace source file:\n  {fp.resolve()}",
+                            flush=True,
+                        )
+                        try:
+                            staged.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        continue
+                    seen_keys.add(key)
+                    staged_cleanup.append(staged)
+                    work.append(staged)
+                except OSError as exc:
+                    print(f"[live] captions-batch: could not stage {fp.name}: {exc}", flush=True)
+
+        return work, staged_cleanup
+
+    def _captions_batch_should_skip_processed(self, portrait_input: Path, *, redo_all: bool) -> bool:
+        """Return True only when ``round_final/{{stem}}_karaoke.mp4`` already exists and is fresh enough.
+
+        Comparing ``*_final.mp4`` timestamps is incorrect: portrait-only finals often match/copy mtime back
+        from ``*_portrait_final`` staging and would skip karaoke forever without this check.
+        """
+        if redo_all:
+            return False
+        stem = portrait_input.stem
+        karaoke_out = self.final_dir / f"{stem}_karaoke.mp4"
+        if not karaoke_out.is_file():
+            return False
+        try:
+            if karaoke_out.stat().st_size < 4096:
+                return False
+        except OSError:
+            return False
+        try:
+            return karaoke_out.stat().st_mtime >= portrait_input.stat().st_mtime
+        except OSError:
+            return False
+
+    def run_captions_batch_on_round_edited(
+        self,
+        *,
+        redo_all: bool = False,
+        sources: Optional[FrozenSet[str]] = None,
+    ) -> int:
+        """Burn captions onto gathered portrait-ish MP4 sources; deliver ``*_final.mp4`` under ``round_final``.
+
+        Uses the configured ``caption_provider`` (default ``karaoke_google``: Cloud Speech-to-Text karaoke burn).
+        Legacy ``karaoke_vertex`` uses Gemini on Vertex instead of Speech — opt-in only.
+
+        Sources (see ``--captions-batch-sources``): ``edited`` (``round_edited``) and optionally ``final``
+        (``round_final`` ``*_portrait_final.mp4`` staged with a ``*_portrait.mp4`` filename).
+        """
+        src = sources if sources is not None else frozenset({"edited", "final"})
+        work_paths, staged_cleanup = self._caption_batch_gather_inputs(src)
+
+        try:
+            if not work_paths:
+                print(
+                    f"[live] captions-batch: no MP4 inputs (sources={sorted(src)}).\n"
+                    f"       round_edited: {self.edit_dir}\n"
+                    f"       round_final:  {self.final_dir}\n"
+                    f"       Expect ``*_portrait.mp4`` in round_edited, or ``*_portrait_final.mp4`` in round_final; "
+                    f"or pass ``--captions-batch-sources edited`` / ``final`` explicitly.",
+                    flush=True,
+                )
+                return 1
+
+            provider = self._resolve_caption_provider()
+            if provider == "none":
+                raise RuntimeError(
+                    'caption_provider is "none"; set karaoke_google (recommended), google_speech, karaoke_vertex '
+                    "(legacy), or shell in JSON / --caption-provider."
+                )
+
+            print(
+                f"[live] captions-batch: {len(work_paths)} clip(s); sources={sorted(src)}; provider={provider}; "
+                f"redo_all={redo_all}",
+                flush=True,
+            )
+
+            ok = skipped = failures = 0
+            outcomes: List[Dict[str, Any]] = []
+
+            for edited in work_paths:
+                if self._captions_batch_should_skip_processed(edited, redo_all=redo_all):
+                    print(
+                        f"[live] captions-batch: skip (karaoke MP4 exists and newer than input): "
+                        f"{(self.final_dir / f'{edited.stem}_karaoke.mp4').name}",
+                        flush=True,
+                    )
+                    skipped += 1
+                    outcomes.append({"input": str(edited), "status": "skipped_karaoke_up_to_date"})
+                    continue
+
+                print(f"[live] captions-batch: processing {edited.name}", flush=True)
+                captioned = self._run_caption_hook(edited)
+                if captioned.resolve() != edited.resolve() and captioned.is_file():
+                    ok += 1
+                    outcomes.append(
+                        {"input": str(edited), "status": "captioned", "captioned": str(captioned)}
+                    )
+                elif captioned.resolve() == edited.resolve():
+                    failures += 1
+                    outcomes.append({"input": str(edited), "status": "failed_or_no_caption_file"})
+                    if provider in ("karaoke_google", "karaoke_vertex"):
+                        print(
+                            "[live] captions-batch WARN: captions path equals portrait-only input — "
+                            "check CAPTIONS mount, Speech/Vertex credentials, timeout, hook logs under meta/",
+                            flush=True,
+                        )
+                final_path = self._final_video_path(edited, captioned)
+                print(f"[live] captions-batch: wrote {final_path.name}", flush=True)
+
+            summary = {
+                "timestamp": _now_stamp(),
+                "sources": sorted(src),
+                "edit_dir": str(self.edit_dir),
+                "final_dir": str(self.final_dir),
+                "provider": provider,
+                "redo_all": redo_all,
+                "ok": ok,
+                "skipped": skipped,
+                "failures": failures,
+                "items": outcomes,
+            }
+            try:
+                out_log = self.meta_dir / f"captions_batch_{_now_stamp()}.json"
+                out_log.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                print(f"[live] captions-batch summary: {out_log.name}", flush=True)
+            except OSError:
+                print(f"[live] captions-batch summary (could not write file): {summary}", flush=True)
+
+            if failures and not ok and not skipped:
+                return 1
+            return 0
+        finally:
+            for s in staged_cleanup:
+                try:
+                    s.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @contextlib.contextmanager
     def _hud_remote_activity_scope(self):
@@ -2957,39 +3349,24 @@ class LiveRoundPipeline:
         except RuntimeError as exc:
             transcript = ""
             stt_note = f"stt_wav_trim_failed: {exc}"
-            try:
-                import whisper
-
-                model = whisper.load_model("tiny")
-                transcript = str((model.transcribe(str(pre_wav)) or {}).get("text") or "").strip()
-                stt_note += " | whisper_tiny(pre_wav)"
-            except Exception as exc2:
-                stt_note += f" | whisper_skip: {exc2}"
         else:
             stt_note = ""
             transcript = ""
             lang = (self.cfg.speech_language_code or "en-US").strip() or "en-US"
             api_key = (self.cfg.speech_api_key or "").strip()
             try:
+                ff_stt = (self.ffmpeg or "").strip() or shutil.which("ffmpeg") or "ffmpeg"
                 _words, transcript = transcribe_google_long_wav(
                     stt_wav,
                     language_code=lang,
                     timeout_sec=min(180.0, float(self.cfg.speech_recognition_timeout_sec or 600)),
                     api_key=api_key if api_key else None,
+                    ffmpeg_bin=ff_stt,
                 )
                 stt_note = "google_cloud_speech (REST key or ADC)"
             except Exception as exc:
+                transcript = ""
                 stt_note = f"google_speech_failed: {exc}"
-                try:
-                    import whisper
-
-                    model = whisper.load_model("tiny")
-                    w_src = stt_wav if stt_wav.is_file() else pre_wav
-                    transcript = str((model.transcribe(str(w_src)) or {}).get("text") or "").strip()
-                    stt_note += " | whisper_tiny_fallback"
-                except Exception as exc2:
-                    transcript = ""
-                    stt_note += f" | transcription_unavailable: {exc2}"
 
         hype_hits = _hype_hits_in_text(transcript or "")
         hype_line = ", ".join(hype_hits) if hype_hits else "(no hype-keyword pattern hits)"
@@ -3579,20 +3956,22 @@ class LiveRoundPipeline:
         )
         return out
 
-    def _vertex_karaoke_auto_available(self) -> bool:
-        """True when Vertex CAPTIONS karaoke can run without an explicit ``caption_provider``."""
-        if not (self.cfg.vertex_project_id or "").strip() or not self.cfg.vertex_api_keys:
+    def _karaoke_google_auto_available(self) -> bool:
+        """True when Google Speech karaoke burn can run (CAPTIONS delegate + Speech credentials)."""
+        caps = _captions_vertex_burn_script_path()
+        if not caps.is_file():
             return False
-        script = _captions_vertex_burn_script_path()
-        if not script.is_file():
+        if not self.cfg.pipeline_config_path.is_file():
             return False
-        rp = (self.cfg.karaoke_vertex_roster_path or "").strip()
-        if rp and not Path(rp).is_file():
-            return False
-        return True
+        speech_ok = bool((self.cfg.speech_api_key or "").strip()) or bool(self.cfg.karaoke_use_adc)
+        return speech_ok
 
     def _resolve_caption_provider(self) -> str:
-        """Expand ``caption_provider=auto`` into a concrete backend (shell / Speech / Vertex karaoke / none)."""
+        """Expand ``caption_provider=auto`` into a concrete backend (shell / Speech karaoke / Speech legacy / none).
+
+        Caption defaults prefer ``karaoke_google`` (Cloud Speech-to-Text → ASS karaoke burn). Vertex Gemini captions
+        are opt-in via explicit ``caption_provider=karaoke_vertex`` only.
+        """
         raw = (self.cfg.caption_provider or "auto").strip().lower()
         if raw != "auto":
             return raw
@@ -3600,10 +3979,10 @@ class LiveRoundPipeline:
         key = (self.cfg.speech_api_key or "").strip()
         if tpl:
             return "shell"
+        if self._karaoke_google_auto_available():
+            return "karaoke_google"
         if key:
             return "google_speech"
-        if self._vertex_karaoke_auto_available():
-            return "karaoke_vertex"
         return "none"
 
     def _run_caption_hook(self, edited_path: Path) -> Path:
@@ -3613,7 +3992,7 @@ class LiveRoundPipeline:
         if provider == "none":
             return edited_path
 
-        if provider in ("karaoke_whisper", "karaoke_google", "karaoke_vertex"):
+        if provider in ("karaoke_google", "karaoke_vertex"):
             if self.cfg.karaoke_async:
                 print(
                     "[live] karaoke_async=true: portrait-only copy goes to *_final.mp4 first; "
@@ -3686,10 +4065,11 @@ class LiveRoundPipeline:
         return out
 
     def _karaoke_burn_preferences(self, video_hint: Path) -> Dict[str, Any]:
-        """Karaoke ASS + logo layout + encode — same source of truth as ``CAPTIONS/burn_karaoke_captions.py``.
+        """Karaoke ASS + logo layout + encode — knobs read from CAPTIONS sidecar JSON (if any) matching inject.
 
-        Prefer ``CAPTIONS/live_pipeline_config.json`` when present (standalone default there); otherwise values from
-        ``self.cfg``'s JSON path. Logo path resolution matches ``CAPTIONS/_resolve_overlay_image``.
+        Prefer ``CAPTIONS/live_pipeline_config.json`` when present; otherwise Esports pipeline JSON.
+        Overlay resolution matches CAPTIONS ``_resolve_overlay_image``. For ``karaoke_google`` the subprocess
+        is ``CAPTIONS/burn_karaoke_captions.py --delegate-esports-karaoke``, which merges these fields into CLI.
         """
         cfg_disk = _captions_sidecar_live_pipeline_json(self.cfg.pipeline_config_path)
         raw = _safe_load_json_settings(cfg_disk)
@@ -3705,8 +4085,19 @@ class LiveRoundPipeline:
         crf = int(pick("karaoke_ffmpeg_crf", c.karaoke_ffmpeg_crf))
         use_adc = bool(pick("karaoke_use_adc", c.karaoke_use_adc))
         no_overlay = bool(pick("karaoke_no_overlay", c.karaoke_no_overlay))
-        wm = str(pick("karaoke_whisper_model", c.karaoke_whisper_model) or "small").strip()
         lang = str(pick("speech_language_code", c.speech_language_code) or "en-US").strip()
+
+        vmx: Optional[float] = None
+        for k_mx in ("karaoke_vertex_inline_video_max_mb", "vertex_inline_video_max_mb"):
+            if k_mx not in raw:
+                continue
+            try:
+                v_candidate = float(raw[k_mx])
+            except (TypeError, ValueError):
+                continue
+            if v_candidate > 0:
+                vmx = v_candidate
+                break
 
         overlay: Optional[Path] = None
         if not no_overlay:
@@ -3720,8 +4111,7 @@ class LiveRoundPipeline:
             if overlay is None:
                 cand = video_hint.parent / CAPTIONS_STANDALONE_OVERLAY_FALLBACK_NAME
                 overlay = cand if cand.is_file() else None
-
-        return {
+        prefs_ret: Dict[str, Any] = {
             "config_path_used": cfg_disk,
             "margin_v_from_top_ratio": margin,
             "overlay_width_frac": owf,
@@ -3729,14 +4119,45 @@ class LiveRoundPipeline:
             "encode_preset": preset,
             "encode_crf": crf,
             "karaoke_use_adc": use_adc,
-            "karaoke_whisper_model": wm,
             "speech_language_code": lang,
             "overlay_image": overlay,
             "karaoke_no_overlay": no_overlay,
         }
+        if vmx is not None:
+            prefs_ret["karaoke_vertex_inline_video_max_mb"] = float(vmx)
+
+        vf = raw.get("karaoke_vertex_send_full_video")
+        if vf is True or vf == 1 or (
+            isinstance(vf, str) and vf.strip().lower() in {"1", "true", "yes", "on"}
+        ):
+            prefs_ret["karaoke_vertex_send_full_video"] = True
+
+        ao = raw.get("karaoke_vertex_audio_only")
+        if ao is True or ao == 1 or (
+            isinstance(ao, str) and ao.strip().lower() in {"1", "true", "yes", "on"}
+        ):
+            prefs_ret["karaoke_vertex_audio_only"] = True
+
+        gcs_au = str(raw.get("vertex_audio_gcs_uri", "") or "").strip()
+        if gcs_au:
+            prefs_ret["vertex_audio_gcs_uri"] = gcs_au
+
+        if raw.get("karaoke_caption_time_offset_sec") is not None:
+            try:
+                prefs_ret["karaoke_caption_time_offset_sec"] = float(raw["karaoke_caption_time_offset_sec"])
+            except (TypeError, ValueError):
+                pass
+
+        imx = raw.get("karaoke_vertex_invert_mux_timing_fix")
+        if imx is True or imx == 1 or (
+            isinstance(imx, str) and imx.strip().lower() in {"1", "true", "yes", "on"}
+        ):
+            prefs_ret["karaoke_vertex_invert_mux_timing_fix"] = True
+
+        return prefs_ret
 
     def _karaoke_validate_can_run(self, edited_path: Path) -> bool:
-        """Return False if karaoke_google / karaoke_vertex prerequisites are missing (Whisper path always OK)."""
+        """Return False if karaoke_google / karaoke_vertex prerequisites are missing."""
         provider = self._resolve_caption_provider()
         if provider == "karaoke_vertex":
             if not self.cfg.vertex_project_id or not self.cfg.vertex_api_keys:
@@ -3750,9 +4171,6 @@ class LiveRoundPipeline:
             if rp and not Path(rp).is_file():
                 print(f"[live] karaoke_vertex: roster file missing ({rp}); skipping karaoke task", flush=True)
                 return False
-            return True
-        backend = "whisper" if provider == "karaoke_whisper" else "google"
-        if backend != "google":
             return True
         prefs = self._karaoke_burn_preferences(edited_path)
         cfg_path = self.cfg.pipeline_config_path
@@ -3831,58 +4249,48 @@ class LiveRoundPipeline:
     def _caption_with_karaoke_subprocess(self, edited_path: Path) -> Path:
         """Isolate karaoke transcribe+burn in a spawned child (``multiprocessing`` spawn).
 
-        Dispatches Whisper/Google karaoke or CAPTIONS Vertex full-video karaoke.
+        ``karaoke_google`` uses the **same router** as manual runs: ``CAPTIONS/burn_karaoke_captions.py
+        --delegate-esports-karaoke`` → ``Esports-Video-clipping-automation/burn_karaoke_captions.py``.
+        ``karaoke_vertex`` invokes Vertex mode on CAPTIONS (no delegate).
         """
         provider = self._resolve_caption_provider()
         if provider == "karaoke_vertex":
             return self._caption_with_karaoke_vertex_subprocess(edited_path)
 
-        backend = "whisper" if provider == "karaoke_whisper" else "google"
+        caps_script = _captions_vertex_burn_script_path()
+        if not caps_script.is_file():
+            print(f"[live] karaoke_google: missing CAPTIONS router ({caps_script}); using portrait-only video")
+            return edited_path
 
         prefs = self._karaoke_burn_preferences(edited_path)
+        cfg_path = self.cfg.pipeline_config_path
+        if not cfg_path.is_file():
+            print(f"[live] karaoke_google: pipeline config missing ({cfg_path}); using portrait-only video")
+            return edited_path
+        if not prefs["karaoke_use_adc"] and not (self.cfg.speech_api_key or "").strip():
+            print(
+                "[live] karaoke_google: need speech_api_key (or karaoke_use_adc=true); "
+                "using portrait-only video",
+                flush=True,
+            )
+            return edited_path
 
-        if backend == "google":
-            cfg_path = self.cfg.pipeline_config_path
-            if not cfg_path.is_file():
-                print(f"[live] karaoke_google: pipeline config missing ({cfg_path}); using portrait-only video")
-                return edited_path
-            if not prefs["karaoke_use_adc"] and not (self.cfg.speech_api_key or "").strip():
-                print(
-                    "[live] karaoke_google: need speech_api_key (or karaoke_use_adc=true); "
-                    "using portrait-only video",
-                    flush=True,
-                )
-                return edited_path
+        if prefs["config_path_used"].resolve() != cfg_path.resolve():
+            print(
+                f"[live] karaoke_google: --config {prefs['config_path_used']} "
+                "(CAPTIONS sidecar — same knobs as standalone CAPTIONS Esports karaoke)",
+                flush=True,
+            )
 
         out_pref = self.final_dir / f"{edited_path.stem}_karaoke.mp4"
-        work = self.meta_dir / "karaoke_work"
-        work.mkdir(parents=True, exist_ok=True)
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_subprocess.json"
 
-        overlay_resolved = prefs["overlay_image"]
-        speech_timeout = float(max(60, self.cfg.speech_recognition_timeout_sec))
-        api_key_val: Optional[str]
-        if backend == "google" and not prefs["karaoke_use_adc"]:
-            api_key_val = (self.cfg.speech_api_key or "").strip() or None
-        else:
-            api_key_val = None
-
         payload: Dict[str, Any] = {
+            "captions_script": str(caps_script.resolve()),
+            "pipeline_config": str(prefs["config_path_used"].resolve()),
             "video_path": str(edited_path.resolve()),
-            "work_dir": str(work.resolve()),
             "video_out": str(out_pref.resolve()),
             "ffmpeg_bin": self.ffmpeg or "",
-            "backend": backend,
-            "whisper_model": str(prefs["karaoke_whisper_model"]),
-            "language_code": str(prefs["speech_language_code"]),
-            "timeout_sec": speech_timeout,
-            "api_key": api_key_val,
-            "margin_v_from_top_ratio": float(prefs["margin_v_from_top_ratio"]),
-            "overlay_width_frac": float(prefs["overlay_width_frac"]),
-            "overlay_margin_bottom_px": int(prefs["overlay_margin_bottom_px"]),
-            "overlay_image": str(overlay_resolved.resolve()) if overlay_resolved else None,
-            "encode_preset": str(prefs["encode_preset"]),
-            "encode_crf": int(prefs["encode_crf"]),
         }
 
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
@@ -3910,14 +4318,10 @@ class LiveRoundPipeline:
             return None
 
         def _safe_hook_payload() -> Dict[str, Any]:
-            logged = dict(payload)
-            ak = logged.get("api_key")
-            if ak:
-                logged["api_key"] = _mask_secret(str(ak))
-            return logged
+            return dict(payload)
 
         ctx = multiprocessing.get_context("spawn")
-        child = ctx.Process(target=_karaoke_burn_child_main, args=(payload,), name="karaoke-burn")
+        child = ctx.Process(target=_karaoke_google_caps_delegate_child_main, args=(payload,), name="karaoke-google-caps")
         child.start()
         child.join(timeout=float(timeout_sec))
 
@@ -3932,7 +4336,7 @@ class LiveRoundPipeline:
         hook_obj: Dict[str, Any] = {
             "timestamp": _now_stamp(),
             "transport": "multiprocessing_spawn",
-            "backend": backend,
+            "backend": "caps_delegate_google_speech",
             "timeout_sec": timeout_sec,
             "child_alive_after_join": timed_out,
             "exitcode": child.exitcode,
@@ -4212,13 +4616,14 @@ class LiveRoundPipeline:
         cp_live = self._resolve_caption_provider()
         captioned = self._run_caption_hook(edited)
         if (
-            cp_live == "karaoke_vertex"
+            cp_live in ("karaoke_google", "karaoke_vertex")
             and captioned.resolve() == edited.resolve()
         ):
             print(
-                "[live] WARN karaoke_vertex: captions were not burned — *_final.mp4 is portrait-only. "
-                "In Docker mount ../CAPTIONS to /app/CAPTIONS (see docker-compose.yml) or set CAPTIONS_BURN_SCRIPT. "
-                f"Burn script path: {_captions_vertex_burn_script_path()}",
+                "[live] WARN karaoke captions were not burned — *_final.mp4 is portrait-only. "
+                "For Speech karaoke: set GOOGLE_SPEECH_API_KEY / speech_api_key / karaoke_use_adc + ADC; "
+                "ensure CAPTIONS is mounted in Docker (see docker-compose). "
+                f"Burn router: {_captions_vertex_burn_script_path()}",
                 flush=True,
             )
         final_video = self._final_video_path(edited, captioned)
@@ -4226,7 +4631,7 @@ class LiveRoundPipeline:
         posted = self._post_to_instagram(final_video, text_pack)
 
         meta_extra: Dict[str, Any] = {}
-        if cp_live in ("karaoke_whisper", "karaoke_google", "karaoke_vertex") and self.cfg.karaoke_async:
+        if cp_live in ("karaoke_google", "karaoke_vertex") and self.cfg.karaoke_async:
             meta_extra["karaoke_async"] = True
             meta_extra["karaoke_expected_mp4"] = str((self.final_dir / f"{edited.stem}_karaoke.mp4").resolve())
 
@@ -4426,7 +4831,7 @@ class LiveRoundPipeline:
         )
         try:
             cp = self._resolve_caption_provider()
-            if cp in ("karaoke_whisper", "karaoke_google", "karaoke_vertex"):
+            if cp in ("karaoke_google", "karaoke_vertex"):
                 if self.cfg.karaoke_async:
                     print(
                         "[live] Karaoke: async — portrait *_final.mp4 first; captions land in *_karaoke.mp4 / "
@@ -4437,18 +4842,16 @@ class LiveRoundPipeline:
                     print(
                         "[live] Karaoke: synchronous — waits for burn before writing captioned *_final.mp4. "
                         "This work runs on highlight-queue worker threads only; the main HUD/screenshot loop "
-                        "stays on its own thread so capture is not paused by Vertex/ffmpeg.",
+                        "stays on its own thread so capture is not paused by ffmpeg.",
                         flush=True,
                     )
-                if cp == "karaoke_vertex":
-                    sp = _captions_vertex_burn_script_path()
-                    ok = sp.is_file()
-                    print(
-                        f"[live] karaoke_vertex script: {sp} (exists={ok}). "
-                        f"If false in Docker, mount CAPTIONS (see docker-compose volumes) or set "
-                        f"CAPTIONS_BURN_SCRIPT / CAPTIONS_KARAOKE_ROOT.",
-                        flush=True,
-                    )
+                sp = _captions_vertex_burn_script_path()
+                ok = sp.is_file()
+                print(
+                    f"[live] karaoke CAPTIONS router: {sp} (exists={ok}). "
+                    "If false in Docker, mount CAPTIONS or set CAPTIONS_BURN_SCRIPT / CAPTIONS_KARAOKE_ROOT.",
+                    flush=True,
+                )
         except Exception:
             pass
 
@@ -4577,6 +4980,7 @@ def _pipeline_builtin_json_defaults() -> Dict[str, Any]:
         "stream_url": "https://www.twitch.tv/videos/2760697668",
         "stream_input_seek_hms": "10:08:25",
         "karaoke_vertex_roster_path": "default_match_roster_navigl.txt",
+        "caption_provider": "karaoke_google",
         "screenshot_interval_sec": 5,
         "screenshot_4k_width": 3840,
         "api_provider": "rekognition",
@@ -4626,12 +5030,20 @@ def _merge_aws_credentials_local_file(config_path: Path, cfg: Dict[str, Any]) ->
         print(f"[live] merged {merged} AWS field(s) from {p.name} (keep out of git)", flush=True)
 
 
-def _load_config(path: Path) -> PipelineConfig:
+def _load_config(path: Path, *, captions_batch_mode: bool = False) -> PipelineConfig:
     raw_cfg = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw_cfg, dict):
         raise ValueError("pipeline config JSON must be an object")
     cfg: Dict[str, Any] = {**_pipeline_builtin_json_defaults(), **raw_cfg}
     _merge_aws_credentials_local_file(path, cfg)
+
+    cp_prov = str(cfg.get("caption_provider", "auto")).strip().lower()
+    if cp_prov == "karaoke_whisper":
+        print(
+            "[live] karaoke_whisper is removed; using karaoke_google (Google Cloud Speech karaoke)",
+            flush=True,
+        )
+        cfg["caption_provider"] = "karaoke_google"
 
     if not str(cfg.get("rules_docx", "") or "").strip():
         cfg["rules_docx"] = str(DEFAULT_HIGHLIGHT_RULES_DOCX)
@@ -4699,16 +5111,17 @@ def _load_config(path: Path) -> PipelineConfig:
         vertex_api_keys_val.append(env_vertex)
     vertex_api_keys_val = list(dict.fromkeys(vertex_api_keys_val))
 
-    if not vertex_project_id:
-        raise ValueError(
-            "vertex_project_id missing (set in JSON or VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT) "
-            "— required for Vertex AI highlight analysis"
-        )
-    if not vertex_api_keys_val:
-        raise ValueError(
-            "vertex_api_keys missing (set vertex_api_key / vertex_api_keys or VERTEX_API_KEY) "
-            "— required for Vertex AI highlight analysis"
-        )
+    if not captions_batch_mode:
+        if not vertex_project_id:
+            raise ValueError(
+                "vertex_project_id missing (set in JSON or VERTEX_PROJECT_ID / GOOGLE_CLOUD_PROJECT) "
+                "— required for Vertex AI highlight analysis"
+            )
+        if not vertex_api_keys_val:
+            raise ValueError(
+                "vertex_api_keys missing (set vertex_api_key / vertex_api_keys or VERTEX_API_KEY) "
+                "— required for Vertex AI highlight analysis"
+            )
 
     seek_sec = _parse_seek_seconds(cfg.get("stream_input_seek_sec"))
     if seek_sec <= 0:
@@ -4822,7 +5235,6 @@ def _load_config(path: Path) -> PipelineConfig:
         vertex_location=vertex_location,
         vertex_api_keys=vertex_api_keys_val,
         pipeline_config_path=path.resolve(),
-        karaoke_whisper_model=str(cfg.get("karaoke_whisper_model", "small")),
         karaoke_margin_top_ratio=float(cfg.get("karaoke_margin_top_ratio", 0.22)),
         karaoke_overlay_width_frac=float(cfg.get("karaoke_overlay_width_frac", 0.52)),
         karaoke_overlay_margin_bottom_px=int(cfg.get("karaoke_overlay_margin_bottom_px", 140)),
@@ -4888,7 +5300,6 @@ def _load_config(path: Path) -> PipelineConfig:
         "google_speech",
         "shell",
         "auto",
-        "karaoke_whisper",
         "karaoke_google",
         "karaoke_vertex",
     }
@@ -4967,14 +5378,31 @@ def main() -> int:
         metavar="MODE",
         help=(
             "Override caption_provider JSON field: "
-            "none | google_speech | shell | auto | karaoke_whisper | karaoke_google | karaoke_vertex"
+            "none | google_speech | shell | auto | karaoke_google (default; Cloud Speech) | karaoke_vertex (legacy Gemini)"
         ),
     )
     parser.add_argument(
-        "--karaoke-whisper-model",
-        default=None,
-        metavar="MODEL",
-        help="Override karaoke_whisper_model for Esports Whisper karaoke only",
+        "--captions-batch-only",
+        action="store_true",
+        help=(
+            "Skip live HUD/capture/highlights; caption batch from round_edited and/or portrait-only finals in "
+            "round_final (see --captions-batch-sources). Writes *_karaoke.mp4 and *_final.mp4 under round_final."
+        ),
+    )
+    parser.add_argument(
+        "--captions-batch-redo-all",
+        action="store_true",
+        help="With --captions-batch-only: re-caption every portrait file even when *_final.mp4 exists and is newer.",
+    )
+    parser.add_argument(
+        "--captions-batch-sources",
+        default="edited,final",
+        metavar="LIST",
+        help=(
+            "Comma list for --captions-batch-only: edited=round_edited, final=round_final *Portrait_final clips "
+            "(copied to meta/captions_batch_stage as *_portrait.mp4). Default edited,final finds finals when "
+            "round_edited is empty."
+        ),
     )
     parser.add_argument(
         "--karaoke-sync",
@@ -4988,10 +5416,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.captions_batch_redo_all and not args.captions_batch_only:
+        parser.error("--captions-batch-redo-all requires --captions-batch-only")
+    if args.captions_batch_only and args.interactive:
+        parser.error("--captions-batch-only cannot be used with --interactive")
+
     _bootstrap_ssl_cert_file_from_certifi()
 
     cfg_path = Path(args.config).resolve()
-    config = _load_config(cfg_path)
+    config = _load_config(cfg_path, captions_batch_mode=args.captions_batch_only)
     stream_url_from_cli = bool(args.stream_url is not None and str(args.stream_url).strip())
     if stream_url_from_cli:
         config = replace(config, stream_url=str(args.stream_url).strip())
@@ -5003,9 +5436,14 @@ def main() -> int:
 
     overrides: Dict[str, Any] = {}
     if args.caption_provider is not None:
-        overrides["caption_provider"] = str(args.caption_provider).strip().lower()
-    if args.karaoke_whisper_model is not None:
-        overrides["karaoke_whisper_model"] = str(args.karaoke_whisper_model).strip()
+        cp_cli = str(args.caption_provider).strip().lower()
+        if cp_cli == "karaoke_whisper":
+            print(
+                "[live] karaoke_whisper is removed; using karaoke_google (Google Cloud Speech karaoke)",
+                flush=True,
+            )
+            cp_cli = "karaoke_google"
+        overrides["caption_provider"] = cp_cli
     if args.karaoke_sync and args.karaoke_async:
         parser.error("use only one of --karaoke-sync and --karaoke-async")
     if args.karaoke_sync:
@@ -5019,18 +5457,58 @@ def main() -> int:
             "google_speech",
             "shell",
             "auto",
-            "karaoke_whisper",
             "karaoke_google",
             "karaoke_vertex",
         }
         if config.caption_provider not in allowed_cp:
             raise ValueError(f"caption_provider must be one of {sorted(allowed_cp)}")
-    if not (config.vertex_project_id or "").strip():
-        raise ValueError("vertex_project_id required for Vertex AI highlight analysis (config or env)")
-    if not config.vertex_api_keys:
-        raise ValueError("vertex_api_key / vertex_api_keys required for Vertex AI highlight analysis")
 
-    pipeline = LiveRoundPipeline(config)
+    if args.captions_batch_only:
+        config = replace(config, karaoke_async=False)
+        cp_default = (config.caption_provider or "").strip().lower()
+        if cp_default in ("auto", "none", ""):
+            config = replace(config, caption_provider="karaoke_google")
+
+    if not args.captions_batch_only:
+        if not (config.vertex_project_id or "").strip():
+            raise ValueError("vertex_project_id required for Vertex AI highlight analysis (config or env)")
+        if not config.vertex_api_keys:
+            raise ValueError("vertex_api_key / vertex_api_keys required for Vertex AI highlight analysis")
+    else:
+        cp_final = (config.caption_provider or "").strip().lower()
+        if cp_final == "karaoke_google" and not config.karaoke_use_adc:
+            if not (config.speech_api_key or "").strip():
+                raise ValueError(
+                    "captions-batch with karaoke_google requires speech credentials: speech_api_key in JSON, "
+                    "GOOGLE_SPEECH_API_KEY, speech_api_key.local.json beside config, vertex_api_key fallback in JSON, "
+                    "or karaoke_use_adc=true with Application Default Credentials for Cloud Speech-to-Text"
+                )
+        if cp_final == "karaoke_vertex" and (
+            not (config.vertex_project_id or "").strip() or not config.vertex_api_keys
+        ):
+            raise ValueError(
+                "captions-batch with karaoke_vertex requires vertex_project_id and vertex API keys (config/env)"
+            )
+
+    pipeline = LiveRoundPipeline(
+        config,
+        init_mode="captions_batch" if args.captions_batch_only else "live",
+    )
+    if args.captions_batch_only:
+        caps_parts = [
+            x.strip().lower()
+            for x in (args.captions_batch_sources or "edited,final").split(",")
+            if x.strip()
+        ]
+        caps_sources_fs: FrozenSet[str] = frozenset(caps_parts) if caps_parts else frozenset({"edited", "final"})
+        unknown = caps_sources_fs - frozenset({"edited", "final"})
+        if unknown:
+            parser.error(f"--captions-batch-sources unknown: {sorted(unknown)} — use edited and/or final")
+        return pipeline.run_captions_batch_on_round_edited(
+            redo_all=args.captions_batch_redo_all,
+            sources=caps_sources_fs,
+        )
+
     if config.highlight_vertex_audio_only:
         print(
             "[live] highlight_vertex_audio_only=true — Vertex receives clip audio + rules_docx text only "

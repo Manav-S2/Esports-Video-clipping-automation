@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Burn top-centered karaoke captions (Speech → ASS → ffmpeg).
+"""Burn top-centered karaoke captions (Google Cloud Speech → ASS → ffmpeg).
 
-Transcription backends:
-
-- **whisper** (default): local OpenAI Whisper via ``openai-whisper`` (same models used by the
-  WhisperFlow streaming stack). No Google API key.
-
-- **google**: Cloud Speech-to-Text (key resolution matches ``live_stream_highlight_pipeline``).
+Transcription uses Cloud Speech-to-Text (key resolution matches ``live_stream_highlight_pipeline``).
 
 Examples::
 
@@ -17,7 +12,7 @@ Examples::
 
     py -3.14 burn_karaoke_captions.py --video ... --no-overlay
 
-    py -3.14 burn_karaoke_captions.py --video ... --backend google --config live_pipeline_config.json
+    py -3.14 burn_karaoke_captions.py --video ... --config live_pipeline_config.json
 
 Caption style: neon green word highlight, white other words, ALL CAPS, thick outline.
 If ``Screenshot 2026-05-01 164644.png`` sits next to the video, it is overlaid bottom-center automatically.
@@ -83,7 +78,7 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     default_cfg = script_dir / "live_pipeline_config.json"
 
-    ap = argparse.ArgumentParser(description="Burn karaoke captions via Whisper or Google Speech + ffmpeg.")
+    ap = argparse.ArgumentParser(description="Burn karaoke captions via Google Cloud Speech + ffmpeg.")
     ap.add_argument(
         "--video",
         type=Path,
@@ -94,19 +89,7 @@ def main() -> int:
     ap.add_argument("--config", type=Path, default=default_cfg, help="Pipeline JSON (for Google Speech keys)")
     ap.add_argument("--work-dir", type=Path, default=None, help="WAV/ASS scratch dir (default: video folder)")
     ap.add_argument("--ffmpeg", default="", help="ffmpeg binary path (default: PATH)")
-    ap.add_argument("--language", default="en-US", help="Language hint (Google: full code; Whisper: base e.g. en)")
-    ap.add_argument(
-        "--backend",
-        choices=("whisper", "google"),
-        default="whisper",
-        help="Transcription backend (default: whisper — local, no API key)",
-    )
-    ap.add_argument(
-        "--whisper-model",
-        default="small",
-        metavar="SIZE",
-        help="OpenAI Whisper model name: tiny, base, small, medium, large, etc. (default: small)",
-    )
+    ap.add_argument("--language", default="en-US", help="Cloud Speech language code (e.g. en-US)")
     ap.add_argument(
         "--margin-top-ratio",
         type=float,
@@ -139,7 +122,7 @@ def main() -> int:
     ap.add_argument(
         "--use-adc",
         action="store_true",
-        help="With --backend google: use Application Default Credentials instead of API key",
+        help="Use Application Default Credentials instead of API key for Cloud Speech",
     )
     ap.add_argument(
         "--encode-preset",
@@ -153,6 +136,30 @@ def main() -> int:
         default=20,
         metavar="N",
         help="libx264 -crf for karaoke burns (default: 20; lower = bigger files / sharper)",
+    )
+    ap.add_argument(
+        "--speech-recognition-timeout-sec",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Speech-to-text timeout for long clips (default: speech_recognition_timeout_sec from pipeline JSON or 600)",
+    )
+    ap.add_argument(
+        "--karaoke-caption-time-offset-sec",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Uniform seconds added to karaoke word timings after mux alignment (negative = captions earlier)",
+    )
+    ap.add_argument(
+        "--karaoke-disable-av-mux-timing-fix",
+        action="store_true",
+        help="Disable ffprobe A/V stream start_time shift (speech vs video PTS alignment)",
+    )
+    ap.add_argument(
+        "--karaoke-invert-mux-timing",
+        action="store_true",
+        help="Invert audio-minus-video mux correction if sync is systematically wrong",
     )
     args = ap.parse_args()
 
@@ -174,27 +181,54 @@ def main() -> int:
                 overlay_img = cand
 
     cfg_path = args.config.resolve()
-    cfg: Dict[str, Any] = {}
-    if args.backend == "google":
-        if not cfg_path.is_file():
-            print(f"[karaoke] config not found: {cfg_path}", file=sys.stderr)
-            return 2
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if not cfg_path.is_file():
+        print(f"[karaoke] config not found: {cfg_path}", file=sys.stderr)
+        return 2
+    cfg: Dict[str, Any] = json.loads(cfg_path.read_text(encoding="utf-8"))
 
-    api_key: str | None
-    if args.backend == "whisper":
-        api_key = None
-    elif args.use_adc:
-        api_key = None
+    if args.speech_recognition_timeout_sec is not None:
+        speech_timeout = float(args.speech_recognition_timeout_sec)
     else:
-        api_key = _resolve_speech_api_key(cfg, cfg_path)
-        if not api_key:
-            print(
-                "[karaoke] No Speech API key: set GOOGLE_SPEECH_API_KEY, speech_api_key.local.json, "
-                "or keys in config — or pass --use-adc.",
-                file=sys.stderr,
-            )
-            return 2
+        try:
+            speech_timeout = float(cfg.get("speech_recognition_timeout_sec") or 600)
+        except (TypeError, ValueError):
+            speech_timeout = 600.0
+    speech_timeout = float(max(60.0, speech_timeout))
+
+    api_key: str | None = None if args.use_adc else _resolve_speech_api_key(cfg, cfg_path)
+    if api_key == "":
+        api_key = None
+
+    def _truthy_json(v: Any) -> bool:
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(v)
+
+    if args.karaoke_caption_time_offset_sec is not None:
+        karaoke_offset_sec = float(args.karaoke_caption_time_offset_sec)
+    else:
+        raw_off = cfg.get("karaoke_caption_time_offset_sec")
+        karaoke_offset_sec = 0.0
+        if raw_off is not None:
+            try:
+                karaoke_offset_sec = float(raw_off)
+            except (TypeError, ValueError):
+                karaoke_offset_sec = 0.0
+
+    disable_mux_fix = bool(args.karaoke_disable_av_mux_timing_fix) or _truthy_json(
+        cfg.get("karaoke_disable_av_mux_timing_fix")
+    )
+    invert_mux_fix = bool(args.karaoke_invert_mux_timing) or _truthy_json(
+        cfg.get("karaoke_google_invert_mux_timing_fix")
+    ) or _truthy_json(cfg.get("karaoke_vertex_invert_mux_timing_fix"))
+
+    if not args.use_adc and not api_key:
+        print(
+            "[karaoke] No Speech credentials: pass --use-adc with ADC set up, "
+            "or set GOOGLE_SPEECH_API_KEY / speech_api_key.local.json / keys in pipeline JSON.",
+            file=sys.stderr,
+        )
+        return 2
 
     ffmpeg_bin = args.ffmpeg.strip() or shutil.which("ffmpeg") or ""
     if not ffmpeg_bin:
@@ -214,7 +248,7 @@ def main() -> int:
 
     print(f"[karaoke] in : {video_in}", flush=True)
     print(f"[karaoke] out: {video_out}", flush=True)
-    print(f"[karaoke] backend: {args.backend}", flush=True)
+    print(f"[karaoke] backend: google_cloud_speech", flush=True)
     if overlay_img:
         print(f"[karaoke] overlay: {overlay_img}", flush=True)
     try:
@@ -223,9 +257,8 @@ def main() -> int:
             work_dir,
             video_out,
             ffmpeg_bin,
-            backend=args.backend,
-            whisper_model=args.whisper_model,
             language_code=args.language,
+            timeout_sec=speech_timeout,
             api_key=api_key,
             margin_v_from_top_ratio=args.margin_top_ratio,
             overlay_image=overlay_img,
@@ -233,14 +266,14 @@ def main() -> int:
             overlay_margin_bottom_px=args.overlay_margin_bottom,
             encode_preset=str(args.encode_preset),
             encode_crf=int(args.encode_crf),
+            karaoke_caption_time_offset_sec=karaoke_offset_sec,
+            karaoke_disable_av_mux_timing_fix=disable_mux_fix,
+            karaoke_invert_mux_timing_fix=invert_mux_fix,
         )
     except Exception as exc:
         if DefaultCredentialsError is not None and isinstance(exc, DefaultCredentialsError):
             print(f"[karaoke] {exc}", file=sys.stderr)
-            print(
-                "[karaoke] Set up ADC or use --backend whisper for local captions.",
-                file=sys.stderr,
-            )
+            print("[karaoke] Set up ADC (``gcloud auth application-default login`` or a service-account JSON).", file=sys.stderr)
             return 4
         raise
     print(f"[karaoke] words={info.get('word_count')} transcript_len={len(info.get('transcript') or '')}", flush=True)
