@@ -1010,6 +1010,12 @@ def _captions_vertex_burn_script_path() -> Path:
     return _captions_workspace_root() / "CAPTIONS" / "burn_karaoke_captions.py"
 
 
+def _esports_karaoke_burn_script_path() -> Path:
+    """``burn_karaoke_captions.py`` next to this module (runs without CAPTIONS router subprocess)."""
+
+    return Path(__file__).resolve().parent / "burn_karaoke_captions.py"
+
+
 CAPTIONS_STANDALONE_OVERLAY_FALLBACK_NAME = "Screenshot 2026-05-01 164644.png"
 
 
@@ -1828,6 +1834,7 @@ def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
     """Same entry as standalone ``CAPTIONS/burn_karaoke_captions.py --delegate-esports-karaoke`` → Esports Speech burn."""
 
     caps_script = Path(payload["captions_script"]).resolve()
+    out_mp4 = Path(payload["video_out"]).resolve()
     cmd: List[str] = [
         sys.executable,
         str(caps_script),
@@ -1837,7 +1844,9 @@ def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
         "--video",
         str(Path(payload["video_path"]).resolve()),
         "--output",
-        str(Path(payload["video_out"]).resolve()),
+        str(out_mp4),
+        "--work-dir",
+        str(out_mp4.parent),
     ]
     ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
     if ffmpeg_bin:
@@ -1847,6 +1856,87 @@ def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
     proc = subprocess.run(
         cmd,
         cwd=str(caps_script.parent),
+        **({"creationflags": low} if low else {}),
+    )
+    code = proc.returncode if proc.returncode is not None else 1
+    raise SystemExit(code)
+
+
+def _karaoke_prefs_for_spawn(prefs: Dict[str, Any]) -> Dict[str, Any]:
+    """Pickle-friendly prefs copy for multiprocessing spawn (Path → str where needed)."""
+    bp = dict(prefs)
+    ov = bp.get("overlay_image")
+    if isinstance(ov, Path):
+        bp["overlay_image"] = str(ov.resolve())
+    elif ov is not None:
+        bp["overlay_image"] = str(ov)
+    cfg = bp.get("config_path_used")
+    if isinstance(cfg, Path):
+        bp["config_path_used"] = str(cfg.resolve())
+    return bp
+
+
+def _karaoke_google_esports_direct_child_main(payload: Dict[str, Any]) -> None:
+    """Call Esports ``burn_karaoke_captions.py`` when CAPTIONS router is absent (standalone clone / minimal layout)."""
+
+    es_main = Path(payload["esports_script"]).resolve()
+    prefs_raw = payload.get("burn_prefs")
+    prefs: Dict[str, Any] = prefs_raw if isinstance(prefs_raw, dict) else {}
+
+    cmd: List[str] = [sys.executable, str(es_main)]
+
+    ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
+    if ffmpeg_bin:
+        cmd += ["--ffmpeg", ffmpeg_bin]
+
+    cmd += [
+        "--config",
+        str(Path(payload["pipeline_config"]).resolve()),
+        "--video",
+        str(Path(payload["video_path"]).resolve()),
+        "--output",
+        str(Path(payload["video_out"]).resolve()),
+        "--work-dir",
+        str(Path(payload["work_dir"]).resolve()),
+    ]
+
+    lang = str(prefs.get("speech_language_code", "") or "").strip()
+    if lang:
+        cmd += ["--language", lang]
+
+    try:
+        cmd += ["--margin-top-ratio", str(float(prefs.get("margin_v_from_top_ratio", 0.22)))]
+        cmd += ["--overlay-width-frac", str(float(prefs.get("overlay_width_frac", 0.52)))]
+        cmd += ["--overlay-margin-bottom", str(int(prefs.get("overlay_margin_bottom_px", 140)))]
+    except (TypeError, ValueError):
+        cmd += ["--margin-top-ratio", "0.22", "--overlay-width-frac", "0.52", "--overlay-margin-bottom", "140"]
+
+    preset = str(prefs.get("encode_preset", "medium") or "medium").strip()
+    cmd += ["--encode-preset", preset]
+    try:
+        crf = int(prefs.get("encode_crf", 20))
+    except (TypeError, ValueError):
+        crf = 20
+    cmd += ["--encode-crf", str(max(10, min(51, crf)))]
+
+    if prefs.get("karaoke_use_adc"):
+        cmd.append("--use-adc")
+    if prefs.get("karaoke_no_overlay"):
+        cmd.append("--no-overlay")
+    else:
+        raw_ov = str(prefs.get("overlay_image") or "").strip()
+        if raw_ov:
+            ov_path = Path(raw_ov)
+            if ov_path.is_file():
+                cmd += ["--overlay-image", str(ov_path.resolve())]
+
+    if prefs.get("karaoke_vertex_invert_mux_timing_fix"):
+        cmd.append("--karaoke-invert-mux-timing")
+
+    low = _subprocess_creationflags_low_priority()
+    proc = subprocess.run(
+        cmd,
+        cwd=str(es_main.parent),
         **({"creationflags": low} if low else {}),
     )
     code = proc.returncode if proc.returncode is not None else 1
@@ -1930,8 +2020,8 @@ class LiveRoundPipeline:
                 )
             else:
                 print(
-                    "[live] caption_provider=auto -> no Speech credentials / no shell template / "
-                    "CAPTIONS router missing (captions off)",
+                    "[live] caption_provider=auto -> captions off "
+                    "(need Speech API key or karaoke_use_adc; CAPTIONS router optional if Esports burn script present)",
                     flush=True,
                 )
         elif cp_raw == "none":
@@ -2321,7 +2411,8 @@ class LiveRoundPipeline:
                     if provider in ("karaoke_google", "karaoke_vertex"):
                         print(
                             "[live] captions-batch WARN: captions path equals portrait-only input — "
-                            "check CAPTIONS mount, Speech/Vertex credentials, timeout, hook logs under meta/",
+                            "check Speech/Vertex credentials, caption_hook_timeout_sec, logs under meta/ "
+                            "(CAPTIONS router optional; Esports karaoke may run without it).",
                             flush=True,
                         )
                 final_path = self._final_video_path(edited, captioned)
@@ -3957,9 +4048,8 @@ class LiveRoundPipeline:
         return out
 
     def _karaoke_google_auto_available(self) -> bool:
-        """True when Google Speech karaoke burn can run (CAPTIONS delegate + Speech credentials)."""
-        caps = _captions_vertex_burn_script_path()
-        if not caps.is_file():
+        """True when Google Speech karaoke burn can run (CAPTIONS router or Esports burn + Speech credentials)."""
+        if not (_captions_vertex_burn_script_path().is_file() or _esports_karaoke_burn_script_path().is_file()):
             return False
         if not self.cfg.pipeline_config_path.is_file():
             return False
@@ -4249,18 +4339,13 @@ class LiveRoundPipeline:
     def _caption_with_karaoke_subprocess(self, edited_path: Path) -> Path:
         """Isolate karaoke transcribe+burn in a spawned child (``multiprocessing`` spawn).
 
-        ``karaoke_google`` uses the **same router** as manual runs: ``CAPTIONS/burn_karaoke_captions.py
-        --delegate-esports-karaoke`` → ``Esports-Video-clipping-automation/burn_karaoke_captions.py``.
-        ``karaoke_vertex`` invokes Vertex mode on CAPTIONS (no delegate).
+        ``karaoke_google`` prefers ``CAPTIONS/burn_karaoke_captions.py --delegate-esports-karaoke`` when that
+        router exists; otherwise runs ``burn_karaoke_captions.py`` in this repo directly (same Speech burn).
+        ``karaoke_vertex`` invokes Vertex mode on CAPTIONS (no Esports-only fallback).
         """
         provider = self._resolve_caption_provider()
         if provider == "karaoke_vertex":
             return self._caption_with_karaoke_vertex_subprocess(edited_path)
-
-        caps_script = _captions_vertex_burn_script_path()
-        if not caps_script.is_file():
-            print(f"[live] karaoke_google: missing CAPTIONS router ({caps_script}); using portrait-only video")
-            return edited_path
 
         prefs = self._karaoke_burn_preferences(edited_path)
         cfg_path = self.cfg.pipeline_config_path
@@ -4282,16 +4367,52 @@ class LiveRoundPipeline:
                 flush=True,
             )
 
+        caps_script = _captions_vertex_burn_script_path()
+        es_script = _esports_karaoke_burn_script_path()
+
         out_pref = self.final_dir / f"{edited_path.stem}_karaoke.mp4"
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_subprocess.json"
 
-        payload: Dict[str, Any] = {
-            "captions_script": str(caps_script.resolve()),
-            "pipeline_config": str(prefs["config_path_used"].resolve()),
-            "video_path": str(edited_path.resolve()),
-            "video_out": str(out_pref.resolve()),
-            "ffmpeg_bin": self.ffmpeg or "",
-        }
+        child_target: Callable[[Dict[str, Any]], None]
+        backend_name: str
+        payload: Dict[str, Any]
+
+        if caps_script.is_file():
+            child_target = _karaoke_google_caps_delegate_child_main
+            backend_name = "caps_delegate_google_speech"
+            payload = {
+                "captions_script": str(caps_script.resolve()),
+                "pipeline_config": str(prefs["config_path_used"].resolve()),
+                "video_path": str(edited_path.resolve()),
+                "video_out": str(out_pref.resolve()),
+                "ffmpeg_bin": self.ffmpeg or "",
+            }
+        elif es_script.is_file():
+            work_dir_final = self.final_dir.resolve()
+            print(
+                f"[live] karaoke_google: CAPTIONS router not found; "
+                f"running Esports burn directly ({es_script.name}); "
+                f"scratch + ASS → {work_dir_final}",
+                flush=True,
+            )
+            child_target = _karaoke_google_esports_direct_child_main
+            backend_name = "esports_direct_google_speech"
+            payload = {
+                "esports_script": str(es_script.resolve()),
+                "pipeline_config": str(prefs["config_path_used"].resolve()),
+                "video_path": str(edited_path.resolve()),
+                "video_out": str(out_pref.resolve()),
+                "work_dir": str(work_dir_final),
+                "ffmpeg_bin": self.ffmpeg or "",
+                "burn_prefs": _karaoke_prefs_for_spawn(prefs),
+            }
+        else:
+            print(
+                f"[live] karaoke_google: missing CAPTIONS router ({caps_script}) and Esports burn ({es_script}); "
+                "using portrait-only video",
+                flush=True,
+            )
+            return edited_path
 
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
         started = time.time()
@@ -4318,10 +4439,11 @@ class LiveRoundPipeline:
             return None
 
         def _safe_hook_payload() -> Dict[str, Any]:
-            return dict(payload)
+            return json.loads(json.dumps(payload, default=str))
 
         ctx = multiprocessing.get_context("spawn")
-        child = ctx.Process(target=_karaoke_google_caps_delegate_child_main, args=(payload,), name="karaoke-google-caps")
+        proc_name = "karaoke-google-caps" if backend_name.startswith("caps") else "karaoke-google-esports"
+        child = ctx.Process(target=child_target, args=(payload,), name=proc_name)
         child.start()
         child.join(timeout=float(timeout_sec))
 
@@ -4336,7 +4458,7 @@ class LiveRoundPipeline:
         hook_obj: Dict[str, Any] = {
             "timestamp": _now_stamp(),
             "transport": "multiprocessing_spawn",
-            "backend": "caps_delegate_google_speech",
+            "backend": backend_name,
             "timeout_sec": timeout_sec,
             "child_alive_after_join": timed_out,
             "exitcode": child.exitcode,
@@ -4358,7 +4480,14 @@ class LiveRoundPipeline:
             )
             return edited_path
 
-        picked = _pick_karaoke_output()
+        picked: Optional[Path] = None
+        try:
+            if out_pref.is_file() and out_pref.stat().st_size > 0:
+                picked = out_pref
+        except OSError:
+            picked = None
+        if picked is None:
+            picked = _pick_karaoke_output()
         if picked is None:
             print("[live] karaoke child finished but no output MP4 found; using portrait-only video")
             return edited_path
@@ -4375,7 +4504,7 @@ class LiveRoundPipeline:
 
         roster = (self.cfg.karaoke_vertex_roster_path or "").strip()
         out_pref = self.final_dir / f"{edited_path.stem}_karaoke.mp4"
-        work = self.meta_dir / "karaoke_vertex_work"
+        work = (self.final_dir / f"{edited_path.stem}_vertex_karaoke_work").resolve()
         work.mkdir(parents=True, exist_ok=True)
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_vertex_subprocess.json"
 
@@ -4622,8 +4751,8 @@ class LiveRoundPipeline:
             print(
                 "[live] WARN karaoke captions were not burned — *_final.mp4 is portrait-only. "
                 "For Speech karaoke: set GOOGLE_SPEECH_API_KEY / speech_api_key / karaoke_use_adc + ADC; "
-                "ensure CAPTIONS is mounted in Docker (see docker-compose). "
-                f"Burn router: {_captions_vertex_burn_script_path()}",
+                "CAPTIONS router is optional (Esports calls burn_karaoke_captions.py directly when missing). "
+                f"Burn router (if present): {_captions_vertex_burn_script_path()}",
                 flush=True,
             )
         final_video = self._final_video_path(edited, captioned)
@@ -4925,18 +5054,39 @@ class LiveRoundPipeline:
             print("[live] aborted during final recorder shutdown", flush=True)
 
 
+def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
+    """Locate ``speech_api_key.local.json``: beside pipeline JSON then mono-repo Esports/CAPTIONS siblings."""
+
+    cfg_dir = config_path.resolve().parent
+    grand = cfg_dir.parent
+    seen_keys: set[str] = set()
+    out: List[Path] = []
+    for p in (
+        cfg_dir / "speech_api_key.local.json",
+        grand / "Esports-Video-clipping-automation" / "speech_api_key.local.json",
+        grand / "CAPTIONS" / "speech_api_key.local.json",
+    ):
+        rk = str(p.resolve())
+        if rk in seen_keys:
+            continue
+        seen_keys.add(rk)
+        out.append(p)
+    return out
+
+
 def _resolve_speech_api_key(cfg: Dict[str, Any], config_path: Path) -> str:
     """Resolve key for Cloud Speech-to-Text captions.
 
-    Precedence: ``GOOGLE_SPEECH_API_KEY`` env → ``speech_api_key.local.json`` beside main config
-    → ``speech_api_key`` in main JSON → same key as ``vertex_api_key`` / ``vertex_api_keys[0]``
-    / ``gemini_api_key`` / ``gemini_api_keys[0]`` (one GCP key for vision + screenshots + captions).
+    Precedence: ``GOOGLE_SPEECH_API_KEY`` env → ``speech_api_key.local.json`` (beside main config **or**
+    sibling ``Esports-Video-clipping-automation`` / ``CAPTIONS`` in a mono-repo) → ``speech_api_key`` in
+    main JSON → same key as ``vertex_api_key`` / ``vertex_api_keys[0]`` / ``gemini_api_key`` / ``gemini_api_keys[0]``.
     """
     env_k = os.getenv("GOOGLE_SPEECH_API_KEY", "").strip()
     if env_k:
         return env_k
-    local_file = config_path.resolve().parent / "speech_api_key.local.json"
-    if local_file.exists():
+    for local_file in _speech_api_key_local_paths(config_path):
+        if not local_file.is_file():
+            continue
         try:
             blob = json.loads(local_file.read_text(encoding="utf-8"))
             if isinstance(blob, dict):
@@ -5382,7 +5532,16 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--captions-batch",
+        dest="captions_batch_only",
+        action="store_true",
+        help=(
+            "Same as --captions-batch-only (shorter name; avoids prefix-ambiguity without this exact flag)."
+        ),
+    )
+    parser.add_argument(
         "--captions-batch-only",
+        dest="captions_batch_only",
         action="store_true",
         help=(
             "Skip live HUD/capture/highlights; caption batch from round_edited and/or portrait-only finals in "
@@ -5392,14 +5551,15 @@ def main() -> int:
     parser.add_argument(
         "--captions-batch-redo-all",
         action="store_true",
-        help="With --captions-batch-only: re-caption every portrait file even when *_final.mp4 exists and is newer.",
+        help="With --captions-batch / --captions-batch-only: re-caption every portrait file even when karaoke is up to date.",
     )
     parser.add_argument(
         "--captions-batch-sources",
         default="edited,final",
         metavar="LIST",
         help=(
-            "Comma list for --captions-batch-only: edited=round_edited, final=round_final *Portrait_final clips "
+            "Comma list with --captions-batch / --captions-batch-only: edited=round_edited, "
+            "final=round_final *Portrait_final clips "
             "(copied to meta/captions_batch_stage as *_portrait.mp4). Default edited,final finds finals when "
             "round_edited is empty."
         ),
@@ -5417,9 +5577,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.captions_batch_redo_all and not args.captions_batch_only:
-        parser.error("--captions-batch-redo-all requires --captions-batch-only")
+        parser.error("--captions-batch-redo-all requires --captions-batch / --captions-batch-only")
     if args.captions_batch_only and args.interactive:
-        parser.error("--captions-batch-only cannot be used with --interactive")
+        parser.error("--captions-batch / --captions-batch-only cannot be used with --interactive")
 
     _bootstrap_ssl_cert_file_from_certifi()
 

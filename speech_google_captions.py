@@ -31,6 +31,7 @@ import shutil
 import ssl
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -150,10 +151,15 @@ def _speech_rest_sync_recognize(
     wav_bytes: bytes,
     api_key: str,
     language_code: str,
+    *,
+    http_timeout_sec: float = 180.0,
+    max_network_attempts: int = 5,
 ) -> Dict[str, Any]:
     """Synchronous ``speech:recognize`` — API keys are supported for audio up to ~1 minute.
 
     Returns the JSON ``RecognizeResponse`` dict (same ``results`` layout as LRO inner response).
+
+    Retries transient ``URLError`` (connection resets, etc.) before failing.
     """
     base = "https://speech.googleapis.com/v1"
     key_q = urllib.parse.quote(api_key, safe="")
@@ -176,12 +182,57 @@ def _speech_rest_sync_recognize(
         method="POST",
     )
     ssl_ctx = _google_https_ssl_context()
-    try:
-        with urllib.request.urlopen(req, timeout=180, context=ssl_ctx) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")[-4000:]
-        raise RuntimeError(f"Speech API recognize failed: HTTP {exc.code} {err_body}") from exc
+    last_network: Optional[Exception] = None
+    retry_http = frozenset({408, 429, 500, 502, 503, 504})
+    for attempt in range(1, max_network_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=http_timeout_sec, context=ssl_ctx) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")[-4000:]
+            if exc.code in retry_http and attempt < max_network_attempts:
+                sleep_s = min(16.0, 0.5 * (2 ** (attempt - 1)))
+                print(
+                    f"[speech] Speech REST HTTP {exc.code}; backoff {sleep_s:.1f}s ({attempt}/{max_network_attempts})",
+                    flush=True,
+                )
+                time.sleep(sleep_s)
+                continue
+            raise RuntimeError(f"Speech API recognize failed: HTTP {exc.code} {err_body}") from exc
+        except urllib.error.URLError as exc:
+            last_network = exc
+            if attempt >= max_network_attempts:
+                raise RuntimeError(
+                    f"Speech API recognize failed: network error after {max_network_attempts} attempts ({exc.reason!r})"
+                ) from exc
+            sleep_s = min(12.0, 0.5 * (2 ** (attempt - 1)))
+            print(
+                f"[speech] Speech REST transient error ({exc.reason!r}); sleeping {sleep_s:.1f}s "
+                f"({attempt}/{max_network_attempts})",
+                flush=True,
+            )
+            time.sleep(sleep_s)
+    raise RuntimeError(
+        "Speech REST: exhausted network retries unexpectedly"
+    ) from last_network
+
+
+def _speech_retry_api_key_rest_with_adc(msg: str) -> bool:
+    """When True, a REST-only failure probably means switching to LRO + ADC might work.
+
+    We avoid bogus ADC attempts on permission/billing/disable errors (often HTTP 403/400 bodies that
+    still mention ``UNAUTHENTICATED`` in JSON text).
+    """
+    hm = re.search(r"Speech API recognize failed: HTTP (\d+)", msg[:12000])
+    if not hm:
+        return False
+    code = int(hm.group(1))
+    if code == 401:
+        return True
+    lowered = msg.lower()
+    if code == 403 and ("api keys are not supported" in lowered or "use application default credentials" in lowered):
+        return True
+    return False
 
 
 _CHUNK_SYNC_MAX_SEC = 52.0
@@ -1142,16 +1193,11 @@ def transcribe_and_burn_karaoke(
     except RuntimeError as exc:
         msg = str(exc)
         used_key = (api_key or "").strip()
-        if used_key and (
-            "401" in msg
-            or "API keys are not supported" in msg
-            or "UNAUTHENTICATED" in msg
-            or "CREDENTIALS_MISSING" in msg
-        ):
+        if used_key and _speech_retry_api_key_rest_with_adc(msg):
             print(
-                "[speech] REST Speech failed with API key; retrying with Application Default Credentials "
-                "(``google-cloud-speech`` + ``GOOGLE_APPLICATION_CREDENTIALS`` or "
-                "``gcloud auth application-default login``).",
+                "[speech] REST Speech rejected API key auth (HTTP 401 / LRO-only messaging); retrying "
+                "with Application Default Credentials (``google-cloud-speech`` + "
+                "``GOOGLE_APPLICATION_CREDENTIALS`` or ``gcloud auth application-default login``).",
                 flush=True,
             )
             words, transcript = transcribe_google_long_wav(

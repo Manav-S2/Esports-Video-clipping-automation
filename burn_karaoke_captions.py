@@ -26,15 +26,36 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
+
+
+def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
+    """Locate ``speech_api_key.local.json`` for mono-repo layouts (CAPTIONS vs Esports config paths)."""
+
+    cfg_dir = config_path.resolve().parent
+    grand = cfg_dir.parent
+    seen_keys: set[str] = set()
+    out: List[Path] = []
+    for p in (
+        cfg_dir / "speech_api_key.local.json",
+        grand / "Esports-Video-clipping-automation" / "speech_api_key.local.json",
+        grand / "CAPTIONS" / "speech_api_key.local.json",
+    ):
+        rk = str(p.resolve())
+        if rk in seen_keys:
+            continue
+        seen_keys.add(rk)
+        out.append(p)
+    return out
 
 
 def _resolve_speech_api_key(cfg: Dict[str, Any], config_path: Path) -> str:
     env_k = os.getenv("GOOGLE_SPEECH_API_KEY", "").strip()
     if env_k:
         return env_k
-    local_file = config_path.resolve().parent / "speech_api_key.local.json"
-    if local_file.exists():
+    for local_file in _speech_api_key_local_paths(config_path):
+        if not local_file.is_file():
+            continue
         try:
             blob = json.loads(local_file.read_text(encoding="utf-8"))
             if isinstance(blob, dict):
