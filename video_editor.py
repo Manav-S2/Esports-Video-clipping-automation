@@ -8,12 +8,11 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Optional, Union
 
 
 def apply_portrait_blur(
-    input_video: Union[str, Path],
-    output_video: Union[str, Path],
+    input_video: str | Path,
+    output_video: str | Path,
     *,
     ffmpeg_bin: str = "ffmpeg",
     width: int = 1080,
@@ -23,7 +22,7 @@ def apply_portrait_blur(
     crf: int = 18,
     preset: str = "slow",
     audio_bitrate: str = "160k",
-    fps: Optional[float] = 30.0,
+    fps: float | None = 30.0,
 ) -> None:
     """Blur-filled portrait (9:16): scaled/blurred background + sharp foreground centered.
 

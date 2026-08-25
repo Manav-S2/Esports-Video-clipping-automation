@@ -5,28 +5,28 @@ import argparse
 import base64
 import contextlib
 import json
-import multiprocessing
 import mimetypes
+import multiprocessing
 import os
+import queue
 import re
 import shutil
 import signal
-import sys
 import subprocess
-import queue
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import warnings
 import wave
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
-
-import warnings
+from typing import Any
 
 # MSYS2 UCRT64 / some Windows builds: NumPy warns about longdouble signature probe; harmless here (we use float32).
 warnings.filterwarnings("ignore", category=UserWarning, module="numpy._core.getlimits")
@@ -50,7 +50,6 @@ from llm_client import (
 )
 from speech_google_captions import transcribe_and_burn, transcribe_google_long_wav
 from video_editor import apply_portrait_blur
-
 
 # Strict live HUD cadence: wall-clock period between successive crop → AI round checks.
 # ``PipelineConfig.screenshot_interval_sec`` is not used for this loop (kept for compatibility / timeouts).
@@ -151,7 +150,7 @@ def _parse_seek_seconds(val: Any) -> float:
         return 0.0
     if isinstance(val, bool):
         return 0.0
-    if isinstance(val, (int, float)):
+    if isinstance(val, int | float):
         return max(0.0, float(val))
     if isinstance(val, str):
         s = val.strip()
@@ -219,7 +218,7 @@ def _now_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def _run_ffmpeg(cmd: List[str]) -> None:
+def _run_ffmpeg(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(
@@ -230,7 +229,7 @@ def _run_ffmpeg(cmd: List[str]) -> None:
         )
 
 
-def _resolve_ffprobe_bin(ffmpeg_bin: Optional[str]) -> Optional[str]:
+def _resolve_ffprobe_bin(ffmpeg_bin: str | None) -> str | None:
     """Locate ``ffprobe`` on PATH or next to ``ffmpeg`` (Windows-friendly)."""
     w = shutil.which("ffprobe")
     if w:
@@ -244,7 +243,7 @@ def _resolve_ffprobe_bin(ffmpeg_bin: Optional[str]) -> Optional[str]:
     return None
 
 
-def _ffprobe_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+def _ffprobe_duration_sec(media_path: Path, ffmpeg_bin: str | None) -> float | None:
     """Return container duration in seconds, or None if unknown."""
     exe = _resolve_ffprobe_bin(ffmpeg_bin)
     if not exe:
@@ -274,7 +273,7 @@ def _ffprobe_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) -> Option
         return None
 
 
-def _ffmpeg_demuxer_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+def _ffmpeg_demuxer_duration_sec(media_path: Path, ffmpeg_bin: str | None) -> float | None:
     """Parse ``Duration:`` from ``ffmpeg -i`` stderr (header read only; no full decode)."""
     if not ffmpeg_bin:
         return None
@@ -297,14 +296,14 @@ def _ffmpeg_demuxer_duration_sec(media_path: Path, ffmpeg_bin: Optional[str]) ->
     return val if val > 0 else None
 
 
-def _clip_duration_for_analysis(media_path: Path, ffmpeg_bin: Optional[str]) -> Optional[float]:
+def _clip_duration_for_analysis(media_path: Path, ffmpeg_bin: str | None) -> float | None:
     d = _ffprobe_duration_sec(media_path, ffmpeg_bin)
     if d is not None:
         return d
     return _ffmpeg_demuxer_duration_sec(media_path, ffmpeg_bin)
 
 
-def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> List[float]:
+def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> list[float]:
     """Timestamps at the center of ``divisions`` equal slices (full timeline coverage)."""
     dur = float(duration_sec)
     k = max(1, int(divisions))
@@ -319,7 +318,7 @@ def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> L
     return [lo + usable * (i + 0.5) / k for i in range(k)]
 
 
-def _mono16_wav_rms_timeline(wav_path: Path, window_sec: float = 0.5) -> Tuple[List[float], List[float], float]:
+def _mono16_wav_rms_timeline(wav_path: Path, window_sec: float = 0.5) -> tuple[list[float], list[float], float]:
     """Sliding-window RMS for mono int16 WAV. Returns (window_center_times_sec, rms_0_1, sample_rate_hz)."""
     try:
         with wave.open(str(wav_path), "rb") as wf:
@@ -336,8 +335,8 @@ def _mono16_wav_rms_timeline(wav_path: Path, window_sec: float = 0.5) -> Tuple[L
         audio = audio.reshape(-1, nch).mean(axis=1)
     w = max(int(float(fr) * float(window_sec)), 256)
     step = max(w // 2, 1)
-    centers: List[float] = []
-    rms_vals: List[float] = []
+    centers: list[float] = []
+    rms_vals: list[float] = []
     i = 0
     while i + w <= len(audio):
         chunk = audio[i : i + w]
@@ -348,7 +347,7 @@ def _mono16_wav_rms_timeline(wav_path: Path, window_sec: float = 0.5) -> Tuple[L
     return centers, rms_vals, float(fr)
 
 
-def _summarize_rms_spikes(centers: List[float], rms_vals: List[float]) -> str:
+def _summarize_rms_spikes(centers: list[float], rms_vals: list[float]) -> str:
     if not rms_vals or not centers or len(rms_vals) != len(centers):
         return "rms_windows=unavailable"
     arr = np.asarray(rms_vals, dtype=np.float64)
@@ -356,8 +355,8 @@ def _summarize_rms_spikes(centers: List[float], rms_vals: List[float]) -> str:
     p95 = float(np.percentile(arr, 95))
     std = float(np.std(arr))
     thresh = max(p95 * 0.9, med + max(2.5 * std, 1e-6))
-    hits: List[str] = []
-    for t, r in zip(centers, rms_vals):
+    hits: list[str] = []
+    for t, r in zip(centers, rms_vals, strict=False):
         if r >= thresh:
             hits.append(f"{t:.2f}s~{r:.3f}")
     top_i = int(np.argmax(arr))
@@ -370,12 +369,12 @@ def _summarize_rms_spikes(centers: List[float], rms_vals: List[float]) -> str:
     return f"median_rms={med:.4f} p95={p95:.4f}; {peak_note} (no windows above adaptive threshold)"
 
 
-def _hype_hits_in_text(text: str) -> List[str]:
+def _hype_hits_in_text(text: str) -> list[str]:
     """Return which hype regexes matched (substring snippets)."""
     if not (text or "").strip():
         return []
     low = text.lower()
-    out: List[str] = []
+    out: list[str] = []
     seen: set[str] = set()
     for pat in HIGHLIGHT_HYPE_KEYWORD_PATTERNS:
         if re.search(pat, low, re.IGNORECASE):
@@ -555,9 +554,9 @@ def _vertex_generate_content(
     vertex_location: str,
     model: str,
     prompt: str,
-    image_path: Optional[Path] = None,
+    image_path: Path | None = None,
     *,
-    audio_path: Optional[Path] = None,
+    audio_path: Path | None = None,
     max_output_tokens: int = 1024,
 ) -> str:
     """Gemini on Vertex AI via REST + API key (see Vertex AI Express Mode / API key auth)."""
@@ -574,7 +573,7 @@ def _vertex_generate_content(
         )
     endpoint = f"{endpoint}?key={urllib.parse.quote(vertex_api_key)}"
 
-    parts: List[Dict[str, Any]] = [{"text": prompt}]
+    parts: list[dict[str, Any]] = [{"text": prompt}]
     if image_path is not None:
         mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
         parts.append(
@@ -602,7 +601,7 @@ def _vertex_generate_content(
             }
         )
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0.0,
@@ -662,7 +661,7 @@ def _vertex_generate_content(
                 continue
             raise RuntimeError(f"Vertex AI request failed: {exc}") from exc
     data = json.loads(raw)
-    texts: List[str] = []
+    texts: list[str] = []
     for candidate in data.get("candidates", []):
         content = candidate.get("content", {})
         for part in content.get("parts", []):
@@ -679,11 +678,11 @@ def _gemini_generate_text(
     api_key: str,
     model: str,
     prompt: str,
-    image_path: Optional[Path] = None,
+    image_path: Path | None = None,
     *,
     max_output_tokens: int = 1024,
 ) -> str:
-    parts: List[Dict[str, Any]] = [{"text": prompt}]
+    parts: list[dict[str, Any]] = [{"text": prompt}]
     if image_path is not None:
         mime = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
         parts.append(
@@ -752,7 +751,7 @@ def _gemini_generate_text(
                 continue
             raise RuntimeError(f"Gemini request failed: {exc}") from exc
     data = json.loads(raw)
-    texts: List[str] = []
+    texts: list[str] = []
     for candidate in data.get("candidates", []):
         content = candidate.get("content", {})
         for part in content.get("parts", []):
@@ -822,7 +821,7 @@ def _captions_sidecar_live_pipeline_json(esports_pipeline_config_used_to_start: 
     return Path(esports_pipeline_config_used_to_start).resolve()
 
 
-def _safe_load_json_settings(path: Path) -> Dict[str, Any]:
+def _safe_load_json_settings(path: Path) -> dict[str, Any]:
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
         return obj if isinstance(obj, dict) else {}
@@ -882,7 +881,7 @@ def _read_interactive_match_context(end_sentinel: str = "END") -> str:
         f"Otherwise paste notes, then type {end_sentinel} on its own line and press Enter.",
         flush=True,
     )
-    lines: List[str] = []
+    lines: list[str] = []
     while True:
         try:
             line = input()
@@ -901,8 +900,8 @@ def _normalize_match_context_for_captions(
     raw_notes: str,
     *,
     prefer_gemini_api: bool = False,
-    gemini_model_override: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
+    gemini_model_override: str | None = None,
+) -> tuple[str, dict[str, Any]]:
     """Expand informal notes into roster text (+ structured extract) via Gemini or Vertex."""
     if not raw_notes.strip():
         return "", {}
@@ -932,7 +931,7 @@ def _normalize_match_context_for_captions(
     )
 
     raw_response = ""
-    last_api_err: Optional[BaseException] = None
+    last_api_err: BaseException | None = None
     model_g = (gemini_model_override or cfg.gemini_model or "gemini-2.5-flash").strip()
 
     if prefer_gemini_api:
@@ -1115,7 +1114,7 @@ def _interactive_session_configure(cfg: PipelineConfig, *, stream_url_from_cli: 
     roster_path = meta / "session_vertex_caption_roster.txt"
     session_log = meta / "interactive_session.json"
 
-    structured_summary: Dict[str, Any] = {}
+    structured_summary: dict[str, Any] = {}
     roster_blob = ""
     raw_ctx = _read_interactive_match_context()
     if not raw_ctx.strip():
@@ -1173,7 +1172,7 @@ def _interactive_session_configure(cfg: PipelineConfig, *, stream_url_from_cli: 
     )
 
 
-def _derived_round_from_scores(detection: Dict[str, Any]) -> Optional[int]:
+def _derived_round_from_scores(detection: dict[str, Any]) -> int | None:
     """Infer round index from team scores when visible: ``round_sum = score_left + score_right``, round = sum + 1."""
     score_left = detection.get("score_left")
     score_right = detection.get("score_right")
@@ -1205,7 +1204,7 @@ def _rekognition_scores_from_crop(
     aws_access_key_id: str = "",
     aws_secret_access_key: str = "",
     aws_session_token: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Call Rekognition ``detect_text`` on JPEG bytes; map left/right team totals from digit WORDs.
 
     Credentials: pass explicit keys (from env merged into config, or JSON), else default boto3
@@ -1227,7 +1226,7 @@ def _rekognition_scores_from_crop(
 
     from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
-    client_kwargs: Dict[str, Any] = {"region_name": region_name}
+    client_kwargs: dict[str, Any] = {"region_name": region_name}
     ak = (aws_access_key_id or "").strip()
     sk = (aws_secret_access_key or "").strip()
     if ak and sk:
@@ -1278,7 +1277,7 @@ def _rekognition_scores_from_crop(
         raise
 
     detections = resp.get("TextDetections") or []
-    id_map: Dict[int, Dict[str, Any]] = {}
+    id_map: dict[int, dict[str, Any]] = {}
     for d in detections:
         raw_id = d.get("Id")
         if raw_id is None:
@@ -1288,7 +1287,7 @@ def _rekognition_scores_from_crop(
         except (TypeError, ValueError):
             continue
 
-    def _line_text_for_detection(d: Dict[str, Any]) -> str:
+    def _line_text_for_detection(d: dict[str, Any]) -> str:
         """Walk ParentId chain to the enclosing LINE's text (if any)."""
         pid = d.get("ParentId")
         hops = 0
@@ -1344,7 +1343,7 @@ def _rekognition_scores_from_crop(
     # Rekognition confidence is 0–100; HUD digits are often a bit weaker — don't match LLM thresholds 1:1.
     eff_min_conf = max(18.0, min(100.0, float(min_confidence_0_1) * 65.0))
 
-    candidates: List[Tuple[float, float, int, float, str]] = []  # cy, cx, val, conf, kind
+    candidates: list[tuple[float, float, int, float, str]] = []  # cy, cx, val, conf, kind
 
     for d in detections:
         dtype = d.get("Type")
@@ -1448,7 +1447,7 @@ class PipelineConfig:
     # When True, Vertex post-round scoring sends clip audio + ``rules_docx`` text only — no JPEG grid / snapshots.
     highlight_vertex_audio_only: bool
     gemini_api_key: str
-    gemini_api_keys: List[str]
+    gemini_api_keys: list[str]
     gemini_model: str
     nvidia_api_key: str
     nvidia_base_url: str
@@ -1514,7 +1513,7 @@ class PipelineConfig:
     # Gemini on Vertex AI (REST + API key): requires project id and Vertex-enabled API key.
     vertex_project_id: str
     vertex_location: str
-    vertex_api_keys: List[str]
+    vertex_api_keys: list[str]
     # Absolute path to the pipeline JSON (Google Speech key resolution for karaoke_google).
     pipeline_config_path: Path
     # Karaoke ASS + optional bottom PNG overlay via isolated child process (``multiprocessing`` spawn).
@@ -1533,19 +1532,19 @@ class PipelineConfig:
     # Roster text path for CAPTIONS Vertex full-video karaoke (set by interactive session or JSON).
     karaoke_vertex_roster_path: str
     # Extra ``streamlink`` CLI args before ``--stream-url`` (all page URLs).
-    streamlink_extra_args: List[str]
+    streamlink_extra_args: list[str]
     # Prepended for twitch.tv URLs only (defaults help Docker/Twitch flakey segments).
-    streamlink_twitch_extra_args: List[str]
+    streamlink_twitch_extra_args: list[str]
     # Timeout seconds for ``streamlink --stream-url`` (Docker/WSL DNS can need >45s).
     streamlink_resolve_timeout_sec: int
 
 
-def _vertex_karaoke_argv_from_prefs(prefs: Dict[str, Any]) -> List[str]:
+def _vertex_karaoke_argv_from_prefs(prefs: dict[str, Any]) -> list[str]:
     """CLI flags for CAPTIONS ``burn_karaoke_captions.py`` **Vertex** mode (not Esports delegate).
 
     Matches margin, overlay layout, Vertex limits/GCS/roster/time-offset knobs from pipeline prefs JSON.
     """
-    out: List[str] = []
+    out: list[str] = []
     lang = str(prefs.get("speech_language_code") or "").strip()
     if lang:
         out += ["--language", lang]
@@ -1588,11 +1587,11 @@ def _vertex_karaoke_argv_from_prefs(prefs: Dict[str, Any]) -> List[str]:
     return out
 
 
-def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
+def _karaoke_vertex_burn_child_main(payload: dict[str, Any]) -> None:
     """Spawn CAPTIONS ``burn_karaoke_captions.py`` (Vertex Gemini karaoke; video when under cap, else MP3)."""
     script = Path(payload["captions_script"])
     roster = str(payload.get("karaoke_vertex_roster_path") or "").strip()
-    cmd: List[str] = [sys.executable, str(script)]
+    cmd: list[str] = [sys.executable, str(script)]
     ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
     if ffmpeg_bin:
         cmd += ["--ffmpeg", ffmpeg_bin]
@@ -1621,12 +1620,12 @@ def _karaoke_vertex_burn_child_main(payload: Dict[str, Any]) -> None:
     raise SystemExit(code)
 
 
-def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
+def _karaoke_google_caps_delegate_child_main(payload: dict[str, Any]) -> None:
     """Same entry as standalone ``CAPTIONS/burn_karaoke_captions.py --delegate-esports-karaoke`` → Esports Speech burn."""
 
     caps_script = Path(payload["captions_script"]).resolve()
     out_mp4 = Path(payload["video_out"]).resolve()
-    cmd: List[str] = [
+    cmd: list[str] = [
         sys.executable,
         str(caps_script),
         "--delegate-esports-karaoke",
@@ -1653,7 +1652,7 @@ def _karaoke_google_caps_delegate_child_main(payload: Dict[str, Any]) -> None:
     raise SystemExit(code)
 
 
-def _karaoke_prefs_for_spawn(prefs: Dict[str, Any]) -> Dict[str, Any]:
+def _karaoke_prefs_for_spawn(prefs: dict[str, Any]) -> dict[str, Any]:
     """Pickle-friendly prefs copy for multiprocessing spawn (Path → str where needed)."""
     bp = dict(prefs)
     ov = bp.get("overlay_image")
@@ -1667,14 +1666,14 @@ def _karaoke_prefs_for_spawn(prefs: Dict[str, Any]) -> Dict[str, Any]:
     return bp
 
 
-def _karaoke_google_esports_direct_child_main(payload: Dict[str, Any]) -> None:
+def _karaoke_google_esports_direct_child_main(payload: dict[str, Any]) -> None:
     """Call Esports ``burn_karaoke_captions.py`` when CAPTIONS router is absent (standalone clone / minimal layout)."""
 
     es_main = Path(payload["esports_script"]).resolve()
     prefs_raw = payload.get("burn_prefs")
-    prefs: Dict[str, Any] = prefs_raw if isinstance(prefs_raw, dict) else {}
+    prefs: dict[str, Any] = prefs_raw if isinstance(prefs_raw, dict) else {}
 
-    cmd: List[str] = [sys.executable, str(es_main)]
+    cmd: list[str] = [sys.executable, str(es_main)]
 
     ffmpeg_bin = str(payload.get("ffmpeg_bin") or "").strip()
     if ffmpeg_bin:
@@ -1836,24 +1835,24 @@ class LiveRoundPipeline:
         self.state_file = self.meta_dir / "round_state.json"
         self.detection_log_file = self.meta_dir / "round_detections.jsonl"
 
-        self.current_round: Optional[int] = None
-        self.record_proc: Optional[subprocess.Popen[str]] = None
-        self.record_round: Optional[int] = None
+        self.current_round: int | None = None
+        self.record_proc: subprocess.Popen[str] | None = None
+        self.record_round: int | None = None
         self.record_started_at: float = 0.0
-        self.record_path: Optional[Path] = None
-        self.record_log_path: Optional[Path] = None
-        self.screenshot_proc: Optional[subprocess.Popen[str]] = None
-        self.screenshot_log_path: Optional[Path] = None
+        self.record_path: Path | None = None
+        self.record_log_path: Path | None = None
+        self.screenshot_proc: subprocess.Popen[str] | None = None
+        self.screenshot_log_path: Path | None = None
         self._resolved_input_url: str = ""
         self._resolved_at: float = 0.0
         # Wall-clock anchor when stream_input_seek_sec > 0 (VOD simulated playback rate ~1x).
         self._vod_playback_anchor_monotonic: float = 0.0
         self._logged_vod_recording_re: bool = False
         # Arm first recording only after the same round is seen this many times in a row.
-        self._arm_round: Optional[int] = None
+        self._arm_round: int | None = None
         self._arm_same_count: int = 0
         # Debounce round boundary: must see the next round this many times before cutting.
-        self._pending_transition_to: Optional[int] = None
+        self._pending_transition_to: int | None = None
         self._pending_transition_count: int = 0
         self._gemini_key_index: int = 0
         self._vertex_key_index: int = 0
@@ -1897,21 +1896,21 @@ class LiveRoundPipeline:
         self.state_file = self.meta_dir / "round_state.json"
         self.detection_log_file = self.meta_dir / "round_detections.jsonl"
 
-        self.current_round: Optional[int] = None
-        self.record_proc: Optional[subprocess.Popen[str]] = None
-        self.record_round: Optional[int] = None
+        self.current_round: int | None = None
+        self.record_proc: subprocess.Popen[str] | None = None
+        self.record_round: int | None = None
         self.record_started_at: float = 0.0
-        self.record_path: Optional[Path] = None
-        self.record_log_path: Optional[Path] = None
-        self.screenshot_proc: Optional[subprocess.Popen[str]] = None
-        self.screenshot_log_path: Optional[Path] = None
+        self.record_path: Path | None = None
+        self.record_log_path: Path | None = None
+        self.screenshot_proc: subprocess.Popen[str] | None = None
+        self.screenshot_log_path: Path | None = None
         self._resolved_input_url: str = ""
         self._resolved_at: float = 0.0
         self._vod_playback_anchor_monotonic: float = 0.0
         self._logged_vod_recording_re: bool = False
-        self._arm_round: Optional[int] = None
+        self._arm_round: int | None = None
         self._arm_same_count: int = 0
-        self._pending_transition_to: Optional[int] = None
+        self._pending_transition_to: int | None = None
         self._pending_transition_count: int = 0
         self._gemini_key_index: int = 0
         self._vertex_key_index: int = 0
@@ -2020,7 +2019,7 @@ class LiveRoundPipeline:
             flush=True,
         )
 
-    def _caption_batch_gather_inputs(self, sources: FrozenSet[str]) -> tuple[List[Path], List[Path]]:
+    def _caption_batch_gather_inputs(self, sources: frozenset[str]) -> tuple[list[Path], list[Path]]:
         """Build ordered caption inputs and ephemeral staged files to delete afterward.
 
         * ``edited`` — ``*_portrait.mp4`` plus other ``*.mp4`` excluding karaoke/captioned/final artefacts.
@@ -2029,8 +2028,8 @@ class LiveRoundPipeline:
 
         Duplicate logical clips dedupe ``edited`` over ``final``.
         """
-        work: List[Path] = []
-        staged_cleanup: List[Path] = []
+        work: list[Path] = []
+        staged_cleanup: list[Path] = []
         seen_keys: set[str] = set()
 
         def try_add(path: Path) -> None:
@@ -2137,7 +2136,7 @@ class LiveRoundPipeline:
         self,
         *,
         redo_all: bool = False,
-        sources: Optional[FrozenSet[str]] = None,
+        sources: frozenset[str] | None = None,
     ) -> int:
         """Burn captions onto gathered portrait-ish MP4 sources; deliver ``*_final.mp4`` under ``round_final``.
 
@@ -2176,7 +2175,7 @@ class LiveRoundPipeline:
             )
 
             ok = skipped = failures = 0
-            outcomes: List[Dict[str, Any]] = []
+            outcomes: list[dict[str, Any]] = []
 
             for edited in work_paths:
                 if self._captions_batch_should_skip_processed(edited, redo_all=redo_all):
@@ -2289,7 +2288,7 @@ class LiveRoundPipeline:
                     flush=True,
                 )
 
-    def _write_meta_json(self, filename: str, payload: Dict[str, Any]) -> Path:
+    def _write_meta_json(self, filename: str, payload: dict[str, Any]) -> Path:
         out = self.meta_dir / filename
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return out
@@ -2297,7 +2296,7 @@ class LiveRoundPipeline:
     def _gemini_generate_text_with_fallback(
         self,
         prompt: str,
-        image_path: Optional[Path] = None,
+        image_path: Path | None = None,
         *,
         max_output_tokens: int = 1024,
     ) -> str:
@@ -2305,7 +2304,7 @@ class LiveRoundPipeline:
         if not keys:
             raise RuntimeError("No Gemini API keys configured.")
 
-        errors: List[str] = []
+        errors: list[str] = []
         for offset in range(len(keys)):
             idx = (self._gemini_key_index + offset) % len(keys)
             key = keys[idx]
@@ -2335,9 +2334,9 @@ class LiveRoundPipeline:
     def _vertex_generate_text_with_fallback(
         self,
         prompt: str,
-        image_path: Optional[Path] = None,
+        image_path: Path | None = None,
         *,
-        audio_path: Optional[Path] = None,
+        audio_path: Path | None = None,
         max_output_tokens: int = 1024,
     ) -> str:
         keys = self.cfg.vertex_api_keys
@@ -2347,7 +2346,7 @@ class LiveRoundPipeline:
         if not pid:
             raise RuntimeError("vertex_project_id is required for Vertex AI.")
 
-        errors: List[str] = []
+        errors: list[str] = []
         model = self.cfg.gemini_model.strip()
         loc = self.cfg.vertex_location.strip() or "us-central1"
         for offset in range(len(keys)):
@@ -2379,11 +2378,11 @@ class LiveRoundPipeline:
 
         raise RuntimeError("All Vertex API keys failed: " + " | ".join(errors))
 
-    def _append_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
+    def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
-    def _log_detection(self, detection: Dict[str, Any], screenshot: Path, status: str) -> None:
+    def _log_detection(self, detection: dict[str, Any], screenshot: Path, status: str) -> None:
         self._append_jsonl(
             self.detection_log_file,
             {
@@ -2396,7 +2395,7 @@ class LiveRoundPipeline:
             },
         )
 
-    def _print_ai_hud_readout(self, screenshot_full: Path, detection: Dict[str, Any]) -> None:
+    def _print_ai_hud_readout(self, screenshot_full: Path, detection: dict[str, Any]) -> None:
         """Echo score reads + derived round (matches scoreboard-sum contract)."""
         sl = detection.get("score_left")
         sr = detection.get("score_right")
@@ -2435,7 +2434,7 @@ class LiveRoundPipeline:
         if "twitch.tv/" in lower or "youtube.com/" in lower or "youtu.be/" in lower:
             # Prefer portable Windows builds only on native Windows. Under Linux/macOS (including Docker bind-mounts),
             # ./streamlink_portable/*.exe may exist from the host but must not run — use pip/system ``streamlink``.
-            streamlink_exec: Optional[str] = None
+            streamlink_exec: str | None = None
             if sys.platform == "win32":
                 portable_candidates = [
                     Path("./streamlink_portable/streamlink.exe"),
@@ -2456,7 +2455,7 @@ class LiveRoundPipeline:
                 )
 
             twitch_low = "twitch.tv/" in lower
-            extras: List[str] = []
+            extras: list[str] = []
             if twitch_low:
                 extras.extend(str(a).strip() for a in (self.cfg.streamlink_twitch_extra_args or []) if str(a).strip())
             extras.extend(str(a).strip() for a in (self.cfg.streamlink_extra_args or []) if str(a).strip())
@@ -2519,7 +2518,7 @@ class LiveRoundPipeline:
             print(f"[live] VOD playback anchor set base_seek_sec={base:.3f}", flush=True)
         return max(0.0, time.monotonic() - self._vod_playback_anchor_monotonic)
 
-    def _ffmpeg_seek_args_before_input(self) -> List[str]:
+    def _ffmpeg_seek_args_before_input(self) -> list[str]:
         """Input-side seek for ffmpeg (VOD / archive); omitted when stream_input_seek_sec is 0."""
         base = float(self.cfg.stream_input_seek_sec or 0)
         if base <= 0:
@@ -2527,7 +2526,7 @@ class LiveRoundPipeline:
         pos = base + self._vod_seek_anchor_elapsed_sec()
         return ["-ss", f"{pos:.3f}"]
 
-    def _ffmpeg_realtime_read_args_before_input(self) -> List[str]:
+    def _ffmpeg_realtime_read_args_before_input(self) -> list[str]:
         """Throttle input demux to ~1× for **long-running** encoders so media time tracks wall clock.
 
         Used by the round **recorder** on VOD. Do **not** add this for one-shot ``-frames:v 1`` HUD grabs:
@@ -2569,14 +2568,14 @@ class LiveRoundPipeline:
         """Clamp ``screenshot_4k_width`` to HUD crop width for ffmpeg scale (up to 4K-wide)."""
         return max(320, min(3840, int(self.cfg.screenshot_4k_width)))
 
-    def _build_hud_capture_vf(self, fps_interval: Optional[int]) -> str:
+    def _build_hud_capture_vf(self, fps_interval: int | None) -> str:
         """fps (optional) → crop ``round_roi_*`` → upscale to vision width → yuv420p for MJPEG."""
         rx = float(max(0.0, min(1.0, self.cfg.round_roi_x)))
         ry = float(max(0.0, min(1.0, self.cfg.round_roi_y)))
         rw = float(max(0.01, min(1.0, self.cfg.round_roi_w)))
         rh = float(max(0.01, min(1.0, self.cfg.round_roi_h)))
         tw = self._hud_vision_scale_width()
-        parts: List[str] = []
+        parts: list[str] = []
         if fps_interval is not None:
             parts.append(f"fps=1/{max(1, int(fps_interval))}")
         parts.append(
@@ -2657,7 +2656,7 @@ class LiveRoundPipeline:
         base_seek = float(self.cfg.stream_input_seek_sec or 0)
         # Same anchor as recording / one-shot grabs: first start uses elapsed=0; daemon restarts seek
         # to base + wall_elapsed so we do not rewind the VOD when only the screenshot ffmpeg restarts.
-        seek_prefix: List[str] = []
+        seek_prefix: list[str] = []
         if base_seek > 0:
             elapsed_wall = self._vod_seek_anchor_elapsed_sec()
             pos = base_seek + elapsed_wall
@@ -2688,7 +2687,7 @@ class LiveRoundPipeline:
         ]
 
         stderr_file = log_path.open("w", encoding="utf-8")
-        popen_kwargs: Dict[str, Any] = {
+        popen_kwargs: dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
             "stderr": stderr_file,
             "text": True,
@@ -2803,9 +2802,9 @@ class LiveRoundPipeline:
 
     _SCREEN_CAPTURE_GLOBS = ("screen_*.jpg", "screen_*.png")
 
-    def _iter_screen_capture_paths(self) -> List[Path]:
+    def _iter_screen_capture_paths(self) -> list[Path]:
         """Paths to HUD crop frames (JPEG from ffmpeg); legacy PNG full frames included. Excludes *_roi*."""
-        found: List[Path] = []
+        found: list[Path] = []
         for pattern in LiveRoundPipeline._SCREEN_CAPTURE_GLOBS:
             found.extend(self.screen_dir.glob(pattern))
         return found
@@ -2828,7 +2827,7 @@ class LiveRoundPipeline:
         after_mtime: float,
         after_name: str,
         deadline: float,
-        stop_flag: Optional[Callable[[], bool]] = None,
+        stop_flag: Callable[[], bool] | None = None,
     ) -> Path:
         """Block until a new screenshot image appears from the ffmpeg daemon (stable size), or deadline.
 
@@ -2836,7 +2835,7 @@ class LiveRoundPipeline:
         coarse clocks. ``stop_flag`` returns True to abort (producer shutdown).
         """
         stable_ok = 0
-        last_key: Optional[tuple[str, int]] = None
+        last_key: tuple[str, int] | None = None
         after_key = (after_mtime, after_name)
 
         def is_newer(st: Any, name: str) -> bool:
@@ -2854,8 +2853,8 @@ class LiveRoundPipeline:
                         log_hint = f" log={self.screenshot_log_path}"
                     raise RuntimeError(f"screenshot ffmpeg exited early code={code}{log_hint}")
 
-            best_p: Optional[Path] = None
-            best_tuple: Tuple[float, str] = (-1.0, "")
+            best_p: Path | None = None
+            best_tuple: tuple[float, str] = (-1.0, "")
 
             for p in self._iter_screen_capture_paths():
                 if "_roi" in p.stem:
@@ -2897,7 +2896,7 @@ class LiveRoundPipeline:
             f"check stream URL and {log_hint}"
         )
 
-    def _detect_round_from_hud_crop(self, crop_path: Path) -> Dict[str, Any]:
+    def _detect_round_from_hud_crop(self, crop_path: Path) -> dict[str, Any]:
         """HUD scores via AWS Rekognition ``DetectText`` on the crop (``api_provider`` is always rekognition)."""
         region = (self.cfg.aws_rekognition_region or "").strip()
         if not region:
@@ -2912,11 +2911,11 @@ class LiveRoundPipeline:
                 aws_session_token=self.cfg.aws_session_token,
             )
 
-    def _detect_round_from_screenshot(self, image_path: Path) -> Dict[str, Any]:
+    def _detect_round_from_screenshot(self, image_path: Path) -> dict[str, Any]:
         """Alias: ``image_path`` is the HUD crop file from ffmpeg."""
         return self._detect_round_from_hud_crop(image_path)
 
-    def _round_from_detection(self, detection: Dict[str, Any]) -> Optional[int]:
+    def _round_from_detection(self, detection: dict[str, Any]) -> int | None:
         """Round index from broadcast scores only: ``score_left + score_right + 1``."""
         scores_round = _derived_round_from_scores(detection)
         detection["scores_derived_round"] = scores_round
@@ -2925,7 +2924,7 @@ class LiveRoundPipeline:
         detection["round_number"] = scores_round
         return scores_round
 
-    def _detection_confidence(self, detection: Dict[str, Any]) -> float:
+    def _detection_confidence(self, detection: dict[str, Any]) -> float:
         """Round HUD JSON omits confidence — treat missing as confident so clears pass ``round_detection_min_confidence``."""
         raw = detection.get("confidence")
         if raw is None:
@@ -2935,7 +2934,7 @@ class LiveRoundPipeline:
         except (TypeError, ValueError):
             return 0.0
 
-    def _scores_derived_agrees_with_round(self, detection: Dict[str, Any], round_num: int) -> bool:
+    def _scores_derived_agrees_with_round(self, detection: dict[str, Any], round_num: int) -> bool:
         """True when ``scores_derived_round`` matches ``round_num`` (same-frame consistency check)."""
         sd = detection.get("scores_derived_round")
         if sd is None:
@@ -2945,7 +2944,7 @@ class LiveRoundPipeline:
         except (TypeError, ValueError):
             return False
 
-    def _accept_detected_round(self, round_num: int, detection: Dict[str, Any]) -> Tuple[bool, str]:
+    def _accept_detected_round(self, round_num: int, detection: dict[str, Any]) -> tuple[bool, str]:
         confidence = self._detection_confidence(detection)
         if confidence < self.cfg.round_detection_min_confidence:
             return False, f"low_confidence_{confidence:.2f}"
@@ -3016,7 +3015,7 @@ class LiveRoundPipeline:
         ]
 
         stderr_file = log_path.open("w", encoding="utf-8")
-        popen_kwargs: Dict[str, Any] = {
+        popen_kwargs: dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
             "stderr": stderr_file,
             "text": True,
@@ -3068,7 +3067,7 @@ class LiveRoundPipeline:
             self._record_suspended_for_hud_idle = False
             print("[live] round recorder resumed (HUD capture running)", flush=True)
 
-    def _stop_round_recording(self) -> Optional[Path]:
+    def _stop_round_recording(self) -> Path | None:
         if not self.record_proc or not self.record_path:
             return None
 
@@ -3263,7 +3262,7 @@ class LiveRoundPipeline:
             f"- hype_keyword_hits: {hype_line}\n"
         )
 
-    def _extract_clip_analysis_audio(self, clip_path: Path, frame_dir: Path) -> Optional[Path]:
+    def _extract_clip_analysis_audio(self, clip_path: Path, frame_dir: Path) -> Path | None:
         """Mono excerpt for Vertex: prefer 128 kbps MP3 @ 22050 Hz; fallback AAC then WAV (PCM)."""
         ff = self.ffmpeg
         if not ff:
@@ -3378,7 +3377,7 @@ class LiveRoundPipeline:
             )
         return None
 
-    def _extract_clip_analysis_frames(self, clip_path: Path, round_number: int) -> Tuple[List[Path], Optional[Path]]:
+    def _extract_clip_analysis_frames(self, clip_path: Path, round_number: int) -> tuple[list[Path], Path | None]:
         """Extract equipart JPEGs via **one** batched ffmpeg (``select``) when possible; else fps fallback."""
         frame_dir = self.meta_dir / f"clip_frames_round_{round_number:02d}_{_now_stamp()}"
         _ensure_dir(frame_dir)
@@ -3388,7 +3387,7 @@ class LiveRoundPipeline:
 
         k = HIGHLIGHT_ANALYSIS_FRAME_COUNT
         dur = _clip_duration_for_analysis(clip_path, ff)
-        frames: List[Path] = []
+        frames: list[Path] = []
 
         if dur is not None and dur > 0:
             times = _highlight_analysis_equipart_times(dur, k)
@@ -3500,12 +3499,12 @@ class LiveRoundPipeline:
         )
         return frames, audio_path
 
-    def _build_clip_contact_sheet(self, frames: List[Path], round_number: int) -> Path:
+    def _build_clip_contact_sheet(self, frames: list[Path], round_number: int) -> Path:
         selected = list(frames)
         if not selected:
             raise RuntimeError("No frames available for contact sheet")
 
-        thumbs: List[Image.Image] = []
+        thumbs: list[Image.Image] = []
         for frame in selected:
             with Image.open(frame) as img:
                 thumb = img.convert("RGB")
@@ -3524,7 +3523,7 @@ class LiveRoundPipeline:
         sheet.save(out, "JPEG", quality=85, optimize=True)
         return out
 
-    def _normalize_highlight_analysis(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_highlight_analysis(self, analysis: dict[str, Any]) -> dict[str, Any]:
         """Ensure ``round_description`` is a string and ``rejection_reason`` exists when rejected."""
         rd_raw = analysis.get("round_description")
         rd = rd_raw.strip() if isinstance(rd_raw, str) else ""
@@ -3537,7 +3536,7 @@ class LiveRoundPipeline:
             return {**analysis, "rejection_reason": "", "round_description": rd}
         if rr:
             return {**analysis, "rejection_reason": rr}
-        parts: List[str] = []
+        parts: list[str] = []
         fr = analysis.get("final_reason")
         if isinstance(fr, str) and fr.strip():
             parts.append(fr.strip())
@@ -3549,12 +3548,12 @@ class LiveRoundPipeline:
         fallback = " ".join(parts) if parts else "Model returned is_highlight=false without a rejection_reason."
         return {**analysis, "rejection_reason": fallback, "round_description": rd}
 
-    def _analyze_clip(self, clip_path: Path, round_number: int) -> Dict[str, Any]:
+    def _analyze_clip(self, clip_path: Path, round_number: int) -> dict[str, Any]:
         """Judge highlight-worthiness via Vertex Gemini: default 9-frame sheet + audio; or audio + ``rules_docx`` only."""
-        frames: List[Path] = []
-        audio_path: Optional[Path] = None
-        contact_sheet: Optional[Path] = None
-        cleanup_dir: Optional[Path] = None
+        frames: list[Path] = []
+        audio_path: Path | None = None
+        contact_sheet: Path | None = None
+        cleanup_dir: Path | None = None
 
         audio_only = bool(self.cfg.highlight_vertex_audio_only)
         rules_body = (self.rules_text or "").strip()
@@ -3945,7 +3944,7 @@ class LiveRoundPipeline:
             return edited_path
         return out
 
-    def _karaoke_burn_preferences(self, video_hint: Path) -> Dict[str, Any]:
+    def _karaoke_burn_preferences(self, video_hint: Path) -> dict[str, Any]:
         """Karaoke ASS + logo layout + encode — knobs read from CAPTIONS sidecar JSON (if any) matching inject.
 
         Prefer ``CAPTIONS/live_pipeline_config.json`` when present; otherwise Esports pipeline JSON.
@@ -3968,7 +3967,7 @@ class LiveRoundPipeline:
         no_overlay = bool(pick("karaoke_no_overlay", c.karaoke_no_overlay))
         lang = str(pick("speech_language_code", c.speech_language_code) or "en-US").strip()
 
-        vmx: Optional[float] = None
+        vmx: float | None = None
         for k_mx in ("karaoke_vertex_inline_video_max_mb", "vertex_inline_video_max_mb"):
             if k_mx not in raw:
                 continue
@@ -3980,7 +3979,7 @@ class LiveRoundPipeline:
                 vmx = v_candidate
                 break
 
-        overlay: Optional[Path] = None
+        overlay: Path | None = None
         if not no_overlay:
             raw_ov = str(pick("karaoke_overlay_image", c.karaoke_overlay_image) or "").strip()
             base = cfg_disk.parent.resolve()
@@ -3992,7 +3991,7 @@ class LiveRoundPipeline:
             if overlay is None:
                 cand = video_hint.parent / CAPTIONS_STANDALONE_OVERLAY_FALLBACK_NAME
                 overlay = cand if cand.is_file() else None
-        prefs_ret: Dict[str, Any] = {
+        prefs_ret: dict[str, Any] = {
             "config_path_used": cfg_disk,
             "margin_v_from_top_ratio": margin,
             "overlay_width_frac": owf,
@@ -4092,7 +4091,7 @@ class LiveRoundPipeline:
             pass
 
         def runner_wrap() -> None:
-            picked: Optional[Path] = None
+            picked: Path | None = None
             try:
                 picked = pipeline._caption_with_karaoke_subprocess(edited_path)
             except Exception as exc:
@@ -4164,9 +4163,9 @@ class LiveRoundPipeline:
         out_pref = self.final_dir / f"{edited_path.stem}_karaoke.mp4"
         hook_log = self.meta_dir / f"{edited_path.stem}_karaoke_subprocess.json"
 
-        child_target: Callable[[Dict[str, Any]], None]
+        child_target: Callable[[dict[str, Any]], None]
         backend_name: str
-        payload: Dict[str, Any]
+        payload: dict[str, Any]
 
         if caps_script.is_file():
             child_target = _karaoke_google_caps_delegate_child_main
@@ -4208,7 +4207,7 @@ class LiveRoundPipeline:
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
         started = time.time()
 
-        def _pick_karaoke_output() -> Optional[Path]:
+        def _pick_karaoke_output() -> Path | None:
             stem = edited_path.stem
             matches = sorted(
                 self.final_dir.glob(f"{stem}_karaoke*.mp4"),
@@ -4229,7 +4228,7 @@ class LiveRoundPipeline:
                     continue
             return None
 
-        def _safe_hook_payload() -> Dict[str, Any]:
+        def _safe_hook_payload() -> dict[str, Any]:
             return json.loads(json.dumps(payload, default=str))
 
         ctx = multiprocessing.get_context("spawn")
@@ -4246,7 +4245,7 @@ class LiveRoundPipeline:
                 child.kill()
                 child.join(5)
 
-        hook_obj: Dict[str, Any] = {
+        hook_obj: dict[str, Any] = {
             "timestamp": _now_stamp(),
             "transport": "multiprocessing_spawn",
             "backend": backend_name,
@@ -4271,7 +4270,7 @@ class LiveRoundPipeline:
             )
             return edited_path
 
-        picked: Optional[Path] = None
+        picked: Path | None = None
         try:
             if out_pref.is_file() and out_pref.stat().st_size > 0:
                 picked = out_pref
@@ -4307,7 +4306,7 @@ class LiveRoundPipeline:
                 flush=True,
             )
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "captions_script": str(script.resolve()),
             "pipeline_config": str(prefs["config_path_used"].resolve()),
             "ffmpeg_bin": str(self.ffmpeg or "").strip(),
@@ -4321,7 +4320,7 @@ class LiveRoundPipeline:
         timeout_sec = max(1, self.cfg.caption_hook_timeout_sec)
         started = time.time()
 
-        def _pick_vertex_output() -> Optional[Path]:
+        def _pick_vertex_output() -> Path | None:
             stem = edited_path.stem
             matches = sorted(
                 self.final_dir.glob(f"{stem}_karaoke*.mp4"),
@@ -4355,7 +4354,7 @@ class LiveRoundPipeline:
                 child.kill()
                 child.join(5)
 
-        hook_obj: Dict[str, Any] = {
+        hook_obj: dict[str, Any] = {
             "timestamp": _now_stamp(),
             "transport": "multiprocessing_spawn",
             "backend": "karaoke_vertex",
@@ -4438,7 +4437,7 @@ class LiveRoundPipeline:
         shutil.copy2(src, out)
         return out
 
-    def _generate_title_and_seo(self, analysis: Dict[str, Any], round_number: int) -> Dict[str, Any]:
+    def _generate_title_and_seo(self, analysis: dict[str, Any], round_number: int) -> dict[str, Any]:
         prompt = (
             "Generate an Instagram Reel title and SEO tags for this CS2 clip. Return strict JSON only: "
             '{"title": string, "caption": string, "seo_keywords": [string]}. '
@@ -4450,7 +4449,7 @@ class LiveRoundPipeline:
             "caption": f"CS2 round {round_number} highlight.",
             "seo_keywords": ["CS2", "CounterStrike2", "esports", "gaming", "highlight"],
         }
-        parsed: Dict[str, Any]
+        parsed: dict[str, Any]
         try:
             txt = self._vertex_generate_text_with_fallback(prompt, None, max_output_tokens=1024)
             parsed = _extract_json(txt)
@@ -4463,7 +4462,7 @@ class LiveRoundPipeline:
             parsed["seo_keywords"] = []
         return parsed
 
-    def _post_to_instagram(self, video_path: Path, text_pack: Dict[str, Any]) -> bool:
+    def _post_to_instagram(self, video_path: Path, text_pack: dict[str, Any]) -> bool:
         if not self.cfg.instagram_enabled:
             return False
 
@@ -4550,7 +4549,7 @@ class LiveRoundPipeline:
         text_pack = self._generate_title_and_seo(analysis, round_number)
         posted = self._post_to_instagram(final_video, text_pack)
 
-        meta_extra: Dict[str, Any] = {}
+        meta_extra: dict[str, Any] = {}
         if cp_live in ("karaoke_google", "karaoke_vertex") and self.cfg.karaoke_async:
             meta_extra["karaoke_async"] = True
             meta_extra["karaoke_expected_mp4"] = str((self.final_dir / f"{edited.stem}_karaoke.mp4").resolve())
@@ -4603,7 +4602,7 @@ class LiveRoundPipeline:
         self._pending_transition_to = None
         self._pending_transition_count = 0
 
-    def _process_or_save_partial_clip(self, clip: Optional[Path], round_number: Optional[int]) -> None:
+    def _process_or_save_partial_clip(self, clip: Path | None, round_number: int | None) -> None:
         if clip is None or round_number is None:
             return
         if self.cfg.process_partial_on_max_duration:
@@ -4651,7 +4650,7 @@ class LiveRoundPipeline:
             if self.current_round is not None and self.record_proc is None:
                 self._start_round_recording(self.current_round)
 
-    def _apply_detection_result(self, screenshot_full: Path, detection: Dict[str, Any]) -> None:
+    def _apply_detection_result(self, screenshot_full: Path, detection: dict[str, Any]) -> None:
         self._check_recording_health()
         round_num = self._round_from_detection(detection)
         self._print_ai_hud_readout(screenshot_full, detection)
@@ -4845,13 +4844,13 @@ class LiveRoundPipeline:
             print("[live] aborted during final recorder shutdown", flush=True)
 
 
-def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
+def _speech_api_key_local_paths(config_path: Path) -> list[Path]:
     """Locate ``speech_api_key.local.json``: beside pipeline JSON then mono-repo Esports/CAPTIONS siblings."""
 
     cfg_dir = config_path.resolve().parent
     grand = cfg_dir.parent
     seen_keys: set[str] = set()
-    out: List[Path] = []
+    out: list[Path] = []
     for p in (
         cfg_dir / "speech_api_key.local.json",
         grand / "Esports-Video-clipping-automation" / "speech_api_key.local.json",
@@ -4865,7 +4864,7 @@ def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
     return out
 
 
-def _resolve_speech_api_key(cfg: Dict[str, Any], config_path: Path) -> str:
+def _resolve_speech_api_key(cfg: dict[str, Any], config_path: Path) -> str:
     """Resolve key for Cloud Speech-to-Text captions.
 
     Precedence: ``GOOGLE_SPEECH_API_KEY`` env → ``speech_api_key.local.json`` (beside main config **or**
@@ -4910,7 +4909,7 @@ def _resolve_speech_api_key(cfg: Dict[str, Any], config_path: Path) -> str:
     return ""
 
 
-def _pipeline_builtin_json_defaults() -> Dict[str, Any]:
+def _pipeline_builtin_json_defaults() -> dict[str, Any]:
     """Defaults merged **before** JSON values from disk — keys present in JSON override these.
 
     Session: NAVI vs GamerLegion (maps Mirage / Ancient); roster body:
@@ -4940,7 +4939,7 @@ def _pipeline_builtin_json_defaults() -> Dict[str, Any]:
     }
 
 
-def _merge_aws_credentials_local_file(config_path: Path, cfg: Dict[str, Any]) -> None:
+def _merge_aws_credentials_local_file(config_path: Path, cfg: dict[str, Any]) -> None:
     """Merge ``aws_credentials.local.json`` (same directory as the pipeline JSON) into ``cfg``.
 
     Use this for Rekognition keys so they are not committed. File is gitignored.
@@ -4975,7 +4974,7 @@ def _load_config(path: Path, *, captions_batch_mode: bool = False) -> PipelineCo
     raw_cfg = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw_cfg, dict):
         raise ValueError("pipeline config JSON must be an object")
-    cfg: Dict[str, Any] = {**_pipeline_builtin_json_defaults(), **raw_cfg}
+    cfg: dict[str, Any] = {**_pipeline_builtin_json_defaults(), **raw_cfg}
     _merge_aws_credentials_local_file(path, cfg)
 
     cp_prov = str(cfg.get("caption_provider", "auto")).strip().lower()
@@ -5022,7 +5021,7 @@ def _load_config(path: Path, *, captions_batch_mode: bool = False) -> PipelineCo
     highlight_api_provider = "vertex"
 
     gemini_api_key_val = cfg.get("gemini_api_key", "") or os.getenv("GEMINI_API_KEY", "")
-    gemini_api_keys_val: List[str] = []
+    gemini_api_keys_val: list[str] = []
     raw_gemini_keys = cfg.get("gemini_api_keys", [])
     if isinstance(raw_gemini_keys, list):
         gemini_api_keys_val.extend(str(key).strip() for key in raw_gemini_keys if str(key).strip())
@@ -5040,7 +5039,7 @@ def _load_config(path: Path, *, captions_batch_mode: bool = False) -> PipelineCo
     )
     vertex_location = str(cfg.get("vertex_location", "us-central1") or "us-central1").strip()
 
-    vertex_api_keys_val: List[str] = []
+    vertex_api_keys_val: list[str] = []
     vertex_single = str(cfg.get("vertex_api_key", "") or "").strip() or os.getenv("VERTEX_API_KEY", "").strip()
     raw_vertex_keys = cfg.get("vertex_api_keys", [])
     if isinstance(raw_vertex_keys, list):
@@ -5385,7 +5384,7 @@ def main() -> int:
         print("[live] --- Interactive session ---", flush=True)
         config = _interactive_session_configure(config, stream_url_from_cli=stream_url_from_cli)
 
-    overrides: Dict[str, Any] = {}
+    overrides: dict[str, Any] = {}
     if args.caption_provider is not None:
         cp_cli = str(args.caption_provider).strip().lower()
         if cp_cli == "karaoke_whisper":
@@ -5451,7 +5450,7 @@ def main() -> int:
             for x in (args.captions_batch_sources or "edited,final").split(",")
             if x.strip()
         ]
-        caps_sources_fs: FrozenSet[str] = frozenset(caps_parts) if caps_parts else frozenset({"edited", "final"})
+        caps_sources_fs: frozenset[str] = frozenset(caps_parts) if caps_parts else frozenset({"edited", "final"})
         unknown = caps_sources_fs - frozenset({"edited", "final"})
         if unknown:
             parser.error(f"--captions-batch-sources unknown: {sorted(unknown)} — use edited and/or final")

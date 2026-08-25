@@ -1,12 +1,14 @@
-import os
 import json
-import time
+import os
 import subprocess
-from pathlib import Path
+import time
 from datetime import datetime
-from loguru import logger
+from pathlib import Path
+
 from google import genai
 from google.genai import types as genai_types
+from loguru import logger
+
 from video_editor import apply_portrait_blur
 
 # Configure Loguru
@@ -14,14 +16,14 @@ logger.add("pipeline.log", rotation="500 MB")
 
 class HighlightPipeline:
     def __init__(self, config_path):
-        with open(config_path, 'r') as f:
+        with open(config_path) as f:
             self.config = json.load(f)
-        
+
         self.client = genai.Client(api_key=self.config['gemini_api_key'])
         self.stream_url = self.config['stream_url']
         self.output_dir = Path("highlights_output")
         self.output_dir.mkdir(exist_ok=True)
-        
+
         self.current_round = None
         self.is_recording = False
         self.record_proc = None
@@ -32,7 +34,7 @@ class HighlightPipeline:
         screenshot_path = "temp_screenshot.jpg"
         # Using streamlink to get the direct URL if needed, or ffmpeg directly
         cmd = [
-            'ffmpeg', '-y', '-i', self.stream_url, 
+            'ffmpeg', '-y', '-i', self.stream_url,
             '-frames:v', '1', '-q:v', '2', screenshot_path
         ]
         try:
@@ -70,7 +72,7 @@ class HighlightPipeline:
         """Starts screen recording the current round."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_video_path = self.output_dir / f"round_{round_num}_{timestamp}_raw.mp4"
-        
+
         # Use ffmpeg to record the stream
         cmd = [
             'ffmpeg', '-y', '-i', self.stream_url,
@@ -97,21 +99,21 @@ class HighlightPipeline:
     def classify_highlight(self, video_path):
         """Uses Gemini to classify if the recorded round is a highlight."""
         logger.info(f"Uploading {video_path} to Gemini for classification...")
-        
+
         # Upload file to Gemini
         video_file = self.client.files.upload(file=str(video_path))
-        
+
         # Wait for processing
         while video_file.state.name == "PROCESSING":
             time.sleep(2)
             video_file = self.client.files.get(name=video_file.name)
-            
+
         if video_file.state.name == "FAILED":
             logger.error("Video processing failed on Gemini.")
             return False
 
         prompt = "Analyze this CS2 round. Is it a highlight (e.g., multi-kill, clutch, insane shots)? Respond with a JSON: {'is_highlight': boolean, 'reason': string, 'title': string, 'seo_keywords': [string]}"
-        
+
         try:
             response = self.client.models.generate_content(
                 model=self.config['gemini_model'],
@@ -127,17 +129,17 @@ class HighlightPipeline:
     def process_highlight(self, video_path, analysis):
         """Edits the video, adds captions (placeholder), and prepares for posting."""
         portrait_video = video_path.with_name(video_path.stem.replace("_raw", "") + "_portrait.mp4")
-        
+
         # 1. Apply portrait blur (1080p)
         apply_portrait_blur(str(video_path), str(portrait_video))
-        
+
         # 2. Add captions (Placeholder for Riverside automation or alternative)
         # For now, we assume the portrait video is ready for the next step.
-        
+
         logger.info(f"Highlight processed: {portrait_video}")
         logger.info(f"Title: {analysis.get('title')}")
         logger.info(f"Keywords: {analysis.get('seo_keywords')}")
-        
+
         # 3. Post to Instagram (Placeholder)
         # self.post_to_instagram(portrait_video, analysis)
 
@@ -148,7 +150,7 @@ class HighlightPipeline:
             if screenshot:
                 detected_round = self.detect_round(screenshot)
                 os.remove(screenshot)
-                
+
                 if detected_round is not None:
                     if not self.is_recording:
                         self.start_recording(detected_round)
@@ -156,15 +158,15 @@ class HighlightPipeline:
                         # New round started, stop current and process
                         self.stop_recording()
                         raw_video = self.current_video_path
-                        
+
                         # Run classification in background or sequentially
                         analysis = self.classify_highlight(raw_video)
                         if analysis and analysis.get('is_highlight'):
                             self.process_highlight(raw_video, analysis)
-                        
+
                         # Start next round
                         self.start_recording(detected_round)
-                
+
             time.sleep(2) # Monitor every 2 seconds
 
 if __name__ == "__main__":

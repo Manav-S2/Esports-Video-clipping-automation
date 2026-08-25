@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from google import genai  # type: ignore
 
@@ -23,7 +23,7 @@ def _canon(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
-def _extract_json(text: str) -> Dict[str, Any]:
+def _extract_json(text: str) -> dict[str, Any]:
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:
@@ -31,8 +31,8 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return json.loads(text[start : end + 1])
 
 
-def _collect_round_kill_pairs(kills_df) -> Dict[int, List[Tuple[str, str]]]:
-    pairs: Dict[int, List[Tuple[str, str]]] = {}
+def _collect_round_kill_pairs(kills_df) -> dict[int, list[tuple[str, str]]]:
+    pairs: dict[int, list[tuple[str, str]]] = {}
     if kills_df is None or len(kills_df) == 0 or "_round_number" not in kills_df.columns:
         return pairs
 
@@ -53,7 +53,7 @@ def _collect_round_kill_pairs(kills_df) -> Dict[int, List[Tuple[str, str]]]:
     return pairs
 
 
-def _analyze_full_video_with_gemini(clip_path: Path, api_key: str, model: str) -> Dict[str, Any]:
+def _analyze_full_video_with_gemini(clip_path: Path, api_key: str, model: str) -> dict[str, Any]:
     root = clip_path.resolve().parent.parent
     demo_path = Path(
         os.getenv(
@@ -156,9 +156,9 @@ def _analyze_full_video_with_gemini(clip_path: Path, api_key: str, model: str) -
     return parsed
 
 
-def _match_round_from_events(root: Path, obs: Dict[str, Any]) -> Dict[str, Any]:
+def _match_round_from_events(root: Path, obs: dict[str, Any]) -> dict[str, Any]:
     demo_dir = root / "blast-open-rotterdam-2026-parivision-vs-falcons-bo3-jB8BGzhBMGFhbYcN6o5bu2"
-    observed_pairs: List[Tuple[str, str]] = []
+    observed_pairs: list[tuple[str, str]] = []
     for e in obs.get("events", []) if isinstance(obs, dict) else []:
         if not isinstance(e, dict):
             continue
@@ -166,8 +166,8 @@ def _match_round_from_events(root: Path, obs: Dict[str, Any]) -> Dict[str, Any]:
 
     map_guess = _canon(str(obs.get("map_guess", ""))) if isinstance(obs, dict) else ""
 
-    candidates: List[Dict[str, Any]] = []
-    round_rows_all: List[Dict[str, object]] = []
+    candidates: list[dict[str, Any]] = []
+    round_rows_all: list[dict[str, object]] = []
 
     for demo in sorted(demo_dir.glob("*.dem")):
         kills_df = _load_kill_events(demo)

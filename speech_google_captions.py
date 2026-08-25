@@ -36,8 +36,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 
 def _google_https_ssl_context() -> ssl.SSLContext:
@@ -94,7 +95,7 @@ def _parse_rest_duration(val: Any) -> float:
     """REST JSON duration: ``\"1.5s\"`` string or ``{seconds, nanos}`` object."""
     if val is None:
         return 0.0
-    if isinstance(val, (int, float)):
+    if isinstance(val, int | float):
         return float(val)
     if isinstance(val, str):
         val = val.strip()
@@ -106,9 +107,9 @@ def _parse_rest_duration(val: Any) -> float:
     return 0.0
 
 
-def _json_results_to_words_and_transcript(response: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
-    words_out: List[Dict[str, Any]] = []
-    transcript_parts: List[str] = []
+def _json_results_to_words_and_transcript(response: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+    words_out: list[dict[str, Any]] = []
+    transcript_parts: list[str] = []
     for result in response.get("results") or []:
         alts = result.get("alternatives") or []
         if not alts:
@@ -154,7 +155,7 @@ def _speech_rest_sync_recognize(
     *,
     http_timeout_sec: float = 180.0,
     max_network_attempts: int = 5,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Synchronous ``speech:recognize`` — API keys are supported for audio up to ~1 minute.
 
     Returns the JSON ``RecognizeResponse`` dict (same ``results`` layout as LRO inner response).
@@ -182,7 +183,7 @@ def _speech_rest_sync_recognize(
         method="POST",
     )
     ssl_ctx = _google_https_ssl_context()
-    last_network: Optional[Exception] = None
+    last_network: Exception | None = None
     retry_http = frozenset({408, 429, 500, 502, 503, 504})
     for attempt in range(1, max_network_attempts + 1):
         try:
@@ -275,10 +276,10 @@ def _transcribe_wav_rest_chunked_api_key(
     language_code: str,
     ffmpeg_bin: str,
     total_duration_sec: float,
-) -> Tuple[List[Dict[str, Any]], str]:
+) -> tuple[list[dict[str, Any]], str]:
     """Synchronous Speech REST (~52s chunks) when clip exceeds API-key single-request limit (~1 minute)."""
-    all_words: List[Dict[str, Any]] = []
-    transcript_chunks: List[str] = []
+    all_words: list[dict[str, Any]] = []
+    transcript_chunks: list[str] = []
     t = 0.0
     idx = 0
     tmpdir = tempfile.mkdtemp(prefix="speech_api_chunk_")
@@ -321,10 +322,10 @@ def transcribe_google_long_wav(
     *,
     language_code: str = "en-US",
     timeout_sec: float = 600.0,
-    api_key: Optional[str] = None,
-    ffmpeg_bin: Optional[str] = None,
-    client_factory: Optional[Callable[[], Any]] = None,
-) -> Tuple[List[Dict[str, Any]], str]:
+    api_key: str | None = None,
+    ffmpeg_bin: str | None = None,
+    client_factory: Callable[[], Any] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
     """Long-running recognition on WAV bytes; returns word dicts and full transcript.
 
     Each word dict: ``{"word": str, "start": float, "end": float}``.
@@ -387,8 +388,8 @@ def transcribe_google_long_wav(
     op = client.long_running_recognize(config=config, audio=audio)
     response = op.result(timeout=timeout_sec)
 
-    words_out: List[Dict[str, Any]] = []
-    transcript_parts: List[str] = []
+    words_out: list[dict[str, Any]] = []
+    transcript_parts: list[str] = []
 
     for result in response.results:
         if not result.alternatives:
@@ -417,7 +418,7 @@ def transcribe_google_long_wav(
 
 
 def words_to_srt(
-    words: List[Dict[str, Any]],
+    words: list[dict[str, Any]],
     *,
     max_chars_per_line: int = 42,
     max_lines: int = 2,
@@ -428,8 +429,8 @@ def words_to_srt(
     if not words:
         return ""
 
-    blocks: List[Tuple[float, float, str]] = []
-    buf: List[str] = []
+    blocks: list[tuple[float, float, str]] = []
+    buf: list[str] = []
     b_start = 0.0
     b_end = 0.0
     buf_text_len = 0
@@ -470,7 +471,7 @@ def words_to_srt(
 
     flush()
 
-    lines: List[str] = []
+    lines: list[str] = []
     for idx, (s, e, txt) in enumerate(blocks, start=1):
         if not txt.strip():
             continue
@@ -481,12 +482,12 @@ def words_to_srt(
     return "\n".join(lines).strip() + ("\n" if lines else "")
 
 
-def _wrap_lines(text: str, max_chars: int, max_lines: int) -> List[str]:
+def _wrap_lines(text: str, max_chars: int, max_lines: int) -> list[str]:
     words = text.split()
     if not words:
         return []
-    lines: List[str] = []
-    cur: List[str] = []
+    lines: list[str] = []
+    cur: list[str] = []
     cur_len = 0
     for w in words:
         add = len(w) + (1 if cur else 0)
@@ -530,7 +531,7 @@ def burn_subtitles_ffmpeg(
     video_out: Path,
     ffmpeg_bin: str,
     *,
-    cwd_for_filter: Optional[Path] = None,
+    cwd_for_filter: Path | None = None,
 ) -> None:
     """Burn subtitles with ffmpeg ``subtitles`` filter (libass)."""
     _burn_subtitles_file_ffmpeg(
@@ -544,7 +545,7 @@ def burn_ass_subtitles_ffmpeg(
     video_out: Path,
     ffmpeg_bin: str,
     *,
-    cwd_for_filter: Optional[Path] = None,
+    cwd_for_filter: Path | None = None,
     x264_preset: str = "slow",
     x264_crf: int = 18,
 ) -> None:
@@ -575,7 +576,7 @@ def _burn_subtitles_file_ffmpeg(
     video_out: Path,
     ffmpeg_bin: str,
     *,
-    cwd_for_filter: Optional[Path] = None,
+    cwd_for_filter: Path | None = None,
     x264_preset: str = "slow",
     x264_crf: int = 18,
 ) -> None:
@@ -689,7 +690,7 @@ def pick_writable_mp4_output(preferred: Path) -> Path:
     return parent / f"{stem}_render_{os.getpid()}{suf}"
 
 
-def probe_video_dimensions(video_path: Path, ffmpeg_bin: str) -> Tuple[int, int]:
+def probe_video_dimensions(video_path: Path, ffmpeg_bin: str) -> tuple[int, int]:
     """Return ``(width, height)`` of the first video stream via ffprobe."""
     cand = Path(ffmpeg_bin)
     ffprobe = shutil.which("ffprobe") or str(cand.parent / "ffprobe.exe")
@@ -756,7 +757,7 @@ def ffprobe_demuxer_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
         return 0.0
 
 
-def _ffprobe_stream_start_sec(media_path: Path, ffmpeg_bin: str, selector: str) -> Optional[float]:
+def _ffprobe_stream_start_sec(media_path: Path, ffmpeg_bin: str, selector: str) -> float | None:
     probe = _resolve_ffprobe_bin_from_ffmpeg(ffmpeg_bin)
     cmd = [
         probe,
@@ -782,10 +783,10 @@ def _ffprobe_stream_start_sec(media_path: Path, ffmpeg_bin: str, selector: str) 
         return None
 
 
-def _clamp_words_duration_to_clip(words: List[Dict[str, Any]], dur: float) -> List[Dict[str, Any]]:
+def _clamp_words_duration_to_clip(words: list[dict[str, Any]], dur: float) -> list[dict[str, Any]]:
     if dur <= 0:
         return words
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for w in words:
         try:
             s = float(w.get("start", 0.0))
@@ -802,7 +803,7 @@ def _clamp_words_duration_to_clip(words: List[Dict[str, Any]], dur: float) -> Li
 
 
 def adjust_speech_words_to_video_timeline(
-    words: List[Dict[str, Any]],
+    words: list[dict[str, Any]],
     *,
     video_path: Path,
     ffmpeg_bin: str,
@@ -810,7 +811,7 @@ def adjust_speech_words_to_video_timeline(
     manual_offset_sec: float = 0.0,
     apply_mux_av_correction: bool = True,
     invert_mux_delta: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Align Cloud Speech timestamps (decoded-audio-relative) with the video timeline ffmpeg uses when burning ASS.
 
     MP4 clips often mux audio slightly after video PTS; subtitles must be shifted by
@@ -886,8 +887,8 @@ def _ass_fg_block(style_colour: str) -> str:
     return "{\\1c" + s + "}"
 
 
-def _metas_rows_clamped(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def _metas_rows_clamped(metas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for m in metas:
         tok = (m.get("word") or "").strip()
         if not tok:
@@ -900,15 +901,15 @@ def _metas_rows_clamped(metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _static_one_line_phrase(
-    rows: List[Dict[str, Any]],
+    rows: list[dict[str, Any]],
     *,
-    highlight_idx: Optional[int],
+    highlight_idx: int | None,
     uppercase: bool,
     highlight_colour: str,
     base_colour: str,
 ) -> str:
     """One horizontal row of words; ``highlight_idx is None`` ⇒ every word ``base_colour``."""
-    parts: List[str] = []
+    parts: list[str] = []
     for j, row in enumerate(rows):
         disp = row["word"].upper() if uppercase else row["word"]
         esc = _ass_escape_token(disp)
@@ -918,7 +919,7 @@ def _static_one_line_phrase(
 
 
 def _dialogues_for_short_block(
-    metas: List[Dict[str, Any]],
+    metas: list[dict[str, Any]],
     *,
     uppercase: bool,
     highlight_colour: str,
@@ -926,13 +927,13 @@ def _dialogues_for_short_block(
     gap_fill_min_sec: float = 0.03,
     word_min_sec: float = 0.03,
     line_open: str = "",
-) -> List[str]:
+) -> list[str]:
     """Separate ``Dialogue`` rows per millisecond-window so libass shows exactly **one** green word."""
     rows = _metas_rows_clamped(metas)
     if not rows:
         return []
 
-    events: List[Tuple[float, float, str]] = []
+    events: list[tuple[float, float, str]] = []
 
     for i in range(len(rows)):
         ws = rows[i]["start"]
@@ -963,7 +964,7 @@ def _dialogues_for_short_block(
             events.append((gs, ge, body))
 
     events.sort(key=lambda t: (t[0], t[1]))
-    lines_out: List[str] = []
+    lines_out: list[str] = []
     for ws, we, body in events:
         if we <= ws:
             we = ws + word_min_sec
@@ -972,7 +973,7 @@ def _dialogues_for_short_block(
 
 
 def words_to_ass_karaoke(
-    words: List[Dict[str, Any]],
+    words: list[dict[str, Any]],
     *,
     play_res_x: int,
     play_res_y: int,
@@ -983,7 +984,7 @@ def words_to_ass_karaoke(
     gap_seconds: float = 0.08,
     margin_v_from_top_ratio: float = 0.22,
     font_name: str = "Arial Black",
-    font_size: Optional[int] = None,
+    font_size: int | None = None,
     karaoke_primary_colour: str = "&H0000FF00",
     karaoke_secondary_colour: str = "&H00FFFFFF",
     karaoke_outline: int = 2,
@@ -1000,8 +1001,8 @@ def words_to_ass_karaoke(
     lines_eff = 1
     mw = max(1, min(int(max_words_per_cue), 8))
 
-    blocks: List[Tuple[float, float, List[Dict[str, Any]]]] = []
-    buf: List[Dict[str, Any]] = []
+    blocks: list[tuple[float, float, list[dict[str, Any]]]] = []
+    buf: list[dict[str, Any]] = []
     b_start = 0.0
     b_end = 0.0
     buf_text_len = 0
@@ -1056,7 +1057,7 @@ def words_to_ass_karaoke(
     # Hormozi-style: thin black stroke, opaque black block shadow down + slight right, no blur.
     line_open = f"{{\\blur0\\bord{ko}\\xshad{x_shad}\\yshad{y_shad}\\4c&H00000000&\\3c&H00000000&}}"
 
-    dialogue_lines: List[str] = []
+    dialogue_lines: list[str] = []
     for _s, _e, metas in blocks:
         dialogue_lines.extend(
             _dialogues_for_short_block(
@@ -1097,8 +1098,8 @@ def transcribe_and_burn(
     *,
     language_code: str = "en-US",
     timeout_sec: float = 600.0,
-    api_key: Optional[str] = None,
-) -> Dict[str, Any]:
+    api_key: str | None = None,
+) -> dict[str, Any]:
     """Full pipeline: extract WAV → Speech-to-Text → SRT → burned MP4."""
     work_dir.mkdir(parents=True, exist_ok=True)
     stem = video_path.stem
@@ -1145,9 +1146,9 @@ def transcribe_and_burn_karaoke(
     *,
     language_code: str = "en-US",
     timeout_sec: float = 600.0,
-    api_key: Optional[str] = None,
+    api_key: str | None = None,
     margin_v_from_top_ratio: float = 0.22,
-    overlay_image: Optional[Path] = None,
+    overlay_image: Path | None = None,
     overlay_width_frac: float = 0.52,
     overlay_margin_bottom_px: int = 140,
     karaoke_primary_colour: str = "&H0000FF00",
@@ -1160,7 +1161,7 @@ def transcribe_and_burn_karaoke(
     karaoke_caption_time_offset_sec: float = 0.0,
     karaoke_disable_av_mux_timing_fix: bool = False,
     karaoke_invert_mux_timing_fix: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Extract WAV → Cloud Speech-to-Text → ASS karaoke → burned MP4 (top-centered highlight).
 
     Requires Google Speech (API key and/or Application Default Credentials) as documented in this module docstring.
