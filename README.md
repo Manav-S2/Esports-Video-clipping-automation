@@ -1,207 +1,99 @@
-# OCR-Max Video Optimization
+# Esports Video Clipping Automation
 
-This workspace includes a high-quality OCR enhancement pipeline for videos.
+End-to-end automation that turns **live CS2 (Counter-Strike 2) esports streams into ready-to-post
+vertical highlight Reels** — recording rounds off a live stream, scoring them for highlight value
+with demo-file analytics and multimodal LLM review, reframing them to 9:16 with blurred
+letterboxing, burning karaoke-style captions from Google Cloud Speech word timestamps, and
+optionally publishing to Instagram.
+
+Built and battle-tested against real broadcast footage (BLAST Open Rotterdam 2026, NAVI vs G2,
+PARIVISION vs Falcons) — see `highlight_result_*.json` for real scored runs.
 
 ## What it does
 
-The script applies an OCR-focused filter chain:
+```
+live stream ──▶ round detection ──▶ per-round recording ──▶ highlight scoring ──▶ portrait edit ──▶ karaoke captions ──▶ post
+  (Twitch/       (Gemini vision      (ffmpeg/streamlink)     (demo .dem stats      (9:16 blur       (Cloud Speech STT     (Instagram,
+   YouTube/       on HUD                                      + Gemini/Vertex       letterbox)       → ASS karaoke →       optional)
+   direct URL)    screenshots)                                + audio RMS hype)                      ffmpeg burn-in)
+```
 
-- Preserves color while enhancing luma contrast for text focus
-- Denoises to reduce OCR confusion from noise
-- Increases local contrast and readability
-- Sharpens text edges
-- Upscales with Lanczos for better character definition
-- Encodes with OCR-friendly compressed H.264 by default for much smaller files
-- Supports optional lossless FFV1 mode when you need maximum fidelity
+## Repository map
 
-## Run
+| Path | Role |
+| --- | --- |
+| `live_stream_highlight_pipeline.py` | Main orchestrator: live monitoring, round recording, Vertex/Gemini highlight scoring, portrait export, caption hooks, SEO text, Instagram posting, crash-safe state |
+| `detect_cs2_highlight.py` | Highlight detector: CS2 demo (`.dem`) parsing via demoparser2, per-round kill/eco features, weighted scoring, Gemini vision fusion, eco-round guard, per-map highlight cap |
+| `speech_google_captions.py` | Google Cloud Speech-to-Text (REST + chunked long-audio + ADC/LRO paths) → SRT / ASS karaoke subtitles, audio-vs-video timeline drift correction, ffmpeg burn-in |
+| `burn_karaoke_captions.py` | CLI wrapper: one command from finished clip to caption-burned output |
+| `video_editor.py` | 16:9 → 9:16 portrait export with blurred background fill (Reels/TikTok framing) |
+| `stream_recorder.py` | Standalone stream round-recorder (screenshot → Gemini round read → per-round capture) |
+| `unified_pipeline.py` | Minimal single-file pipeline variant (record → classify → portrait edit) |
+| `ask_gemini_clip5_reason.py`, `clip5_*.py`, `inspect_clip5_round.py`, `ask_nvidia_clip_highlight.py` | Model-evaluation harnesses used to tune the highlight prompts (Gemini / NVIDIA NIM) |
+| `ocr_max_optimize.ps1`, `extract_killfeed_snapshots.ps1`, `rebuild_every_second_8k.ps1`, `optimize_frames_numpy_pandas.py` | OCR-grade video enhancement + killfeed ROI extraction toolchain (earlier OCR-based detection approach) |
+| `speech_google_captions.py` + `CAPTIONS/` | Caption styling assets and outputs |
+| `Dockerfile`, `docker-compose.yml`, `.dockerignore` | Container packaging for VM deployment |
+| `tests/` | Unit tests for the pure scoring/parsing/caption logic (`python -m unittest discover tests`) |
+| `docs/` | [Architecture](docs/ARCHITECTURE.md) · [Setup](docs/SETUP.md) · [Tool reference](docs/TOOLS.md) |
+
+## Quick start
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4"
-```
-
-Optional parameters:
-
-```powershell
--OutputVideo "D:\path\to\output.ocr-max.mp4"   # custom output path
--ScaleFactor 2                                     # 1 to 4
--Crf 18                                            # compressed mode quality (lower is higher quality)
--Preset slow                                       # ultrafast..veryslow (speed vs compression)
--Codec h264                                        # h264 (faster) or h265 (smaller, slower)
--Lossless                                          # switch to FFV1 MKV output (very large files)
--Binarize                                          # hard black/white text mode
--Threshold 150                                     # threshold used with -Binarize
-```
-
-## Highest clarity mode (compressed, recommended default)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Crf 18 -Preset slow -Binarize -Threshold 155
-```
-
-If text strokes break, reduce threshold (for example `-Threshold 135`).
-If background bleed remains, raise threshold (for example `-Threshold 170`).
-
-## True lossless archival mode (largest files)
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Lossless -Binarize -Threshold 155
-```
-
-Use this mode only when you need mathematically lossless output for repeated processing.
-
-## Smaller compressed files with H.265
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Codec h265 -Crf 20 -Preset slow -Binarize -Threshold 155
-```
-
-H.265 is usually slower to encode than H.264, but often produces smaller files at similar visual quality.
-
-## Extract every second, upscale to 8K, and rebuild video
-
-Use this script when you want one image per second from a clip, run NumPy+pandas color optimization and sharpening (no grayscale), then upscale each image to 8K, then combine all images back into one video.
-
-Current default profile is tuned for natural-looking output (clean profile):
-
-- NumPy+pandas stage is disabled by default
-- JPG extraction quality defaults to 2 (higher quality)
-- Final encode defaults to H.264 CRF 14, preset slow
-
-Install Python dependencies once:
-
-```powershell
-pip install numpy pandas pillow
-```
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\rebuild_every_second_8k.ps1 -InputVideo "E:\27 (1).mp4"
-```
-
-Optional parameters:
-
-```powershell
--WorkingDir "D:\temp\every_second_work"            # where extracted/upscaled frames are stored
--OutputVideo "D:\output\clip.every-second.8k.mp4"  # final combined video path
--Codec h264|h265                                     # encoder for final 8K video
--Crf 14                                               # quality (lower = better quality)
--Preset slow                                          # speed vs compression
--JpegQuality 2                                        # frame JPG quality (2 best, 31 lowest)
--UseNumpyPandasOptimization                           # opt in to NumPy+pandas enhancement stage
--SkipNumpyPandasOptimization                          # force-disable NumPy stage when opt-in is set
--PythonExe "C:\Python313\python.exe"               # optional explicit Python path
--SharpenAmount 1.4                                    # NumPy unsharp detail boost
--SaturationBoost 1.07                                 # color boost, no grayscale conversion
-```
-
-Default behavior:
-
-- Extracts at exactly 1 FPS (`fps=1`), so each second of source video contributes one image.
-  -Skips NumPy+pandas stage unless `-UseNumpyPandasOptimization` is explicitly passed.
-  -Adds FFmpeg upscaling and sharpening while preserving color.
-- Upscales optimized frames to 7680x4320 with Lanczos.
-- Rebuilds output as a 1 FPS video from the 8K frames.
-
-## Killfeed ROI extraction (clear OCR snapshots)
-
-Use this script when you want cleaner killfeed detection and snapshots with a folder layout similar to your existing runs.
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\extract_killfeed_snapshots.ps1 -InputVideo "D:\path\to\your\video.mp4"
-```
-
-Optional parameters:
-
-```powershell
--OutputDir "D:\path\killfeed_snapshots_YYYY-MM-DD_HH-mm-ss"  # run folder root
--SampleFps 8                                                     # OCR scan sampling rate
--MinTextLength 8                                                 # lower for short names
--Threshold 155                                                   # binarization threshold
--RoiX 0.50 -RoiY 0.00 -RoiW 0.50 -RoiH 0.50                    # top-right quarter crop ratios
-```
-
-The run folder is recreated with this structure each run:
-
-```text
-killfeed_snapshots_YYYY-MM-DD_HH-mm-ss/
-	frames_raw/           # full-frame PNG samples
-	frames_killfeed_roi/  # cropped killfeed ROI PNGs
-	frames_ocr_ready/     # thresholded OCR-ready ROI PNGs
-	snapshots/            # detected events: *_full.png and *_roi.png
-	meta/
-		ocr_scan.csv
-		killfeed_events.csv
-		killfeed_extracted_summary.txt
-```
-
-## CS2 highlight detection (demo + Gemini)
-
-Use this script to classify whether a clip is a highlight candidate by combining:
-
-- Demo-derived match signals from `.dem`, `.rar`, or a directory of `.dem` files
-- Gemini vision analysis from sampled video frames
-
-Script:
-
-```text
-detect_cs2_highlight.py
-```
-
-Recommended setup in a standard Python venv:
-
-```powershell
-python -m venv .venv-win
-.\.venv-win\Scripts\activate
+# 1. Environment (Windows; see docs/SETUP.md for Docker and details)
+python -m venv .venv
+.\.venv\Scripts\activate
 pip install -r requirements.txt
+# ffmpeg + streamlink must be on PATH
+
+# 2. Credentials (never committed — see SECURITY.md)
+copy live_pipeline_config.example.json live_pipeline_config.json   # fill in keys
+copy speech_api_key.local.example.json speech_api_key.local.json
+
+# 3. Run the live pipeline
+$env:GEMINI_API_KEY = "YOUR_KEY"
+python .\live_stream_highlight_pipeline.py --config .\live_pipeline_config.json
 ```
 
-Run with both demo folder and clip video:
+Offline highlight screening of an existing clip + demo:
 
 ```powershell
-$env:GEMINI_API_KEY="YOUR_KEY"
-python .\detect_cs2_highlight.py `
-  --demo-input "C:\path\to\demo_folder" `
-  --video-path "C:\path\to\clip.mp4" `
-  --output-json "C:\path\to\result.json"
+python .\detect_cs2_highlight.py --demo-input "C:\demos" --video-path "C:\clip.mp4" --output-json result.json
 ```
 
-Useful options:
-
-```text
---gemini-model gemini-2.0-flash
---frame-sample-seconds 2.0
---max-frames 10
---demo-weight 0.55
---vision-weight 0.45
-```
-
-## Live CS2 clip bot
-
-Use this pipeline when you want to monitor a live stream, record each detected round, classify highlights with Gemini, export a 1080x1920 portrait Reel with blurred top/bottom background, optionally run a caption command, generate title/SEO text, and optionally post with Instagram.
+Burn karaoke captions onto a finished clip:
 
 ```powershell
-$env:GEMINI_API_KEY="YOUR_KEY"
-python .\live_stream_highlight_pipeline.py --config .\live_pipeline_config.example.json
+py -3.14 burn_karaoke_captions.py --video "C:\path\to\clip_portrait.mp4"
 ```
 
-Important config fields:
+## Highlight scoring model
 
-- `stream_url`: direct media URL, Twitch URL, or YouTube URL. Twitch/YouTube page URLs require `streamlink`.
-- `screenshot_interval_sec`: screenshot cadence for round monitoring. Use `2` for the intended live loop.
-- `round_detection_min_confidence`: Gemini confidence threshold before accepting a detected round.
-- `max_round_jump`: guards against bad HUD reads that jump too many rounds ahead.
-- `highlight_vertex_audio_only`: when `true`, post-round Vertex scoring uses **clip audio + `rules_docx` text only** (semantic match to your Word rules; no JPEG snapshots or contact sheet). When `false`, Vertex gets the default **nine thumbnails + optional audio**.
-- `caption_cmd_template`: optional command hook. It receives `{input}` and `{output}` placeholders and should create the captioned output file.
-- `instagram_enabled`: set to `true` only after local dry-runs look good. Credentials can come from config or `INSTA_USER` / `INSTA_PASS`.
+Per-round features extracted from the demo file (kills, kills/minute, headshot ratio,
+multi-kill burst score, unique killers) are combined by a weighted heuristic with a logistic
+confidence curve, then fused with a Gemini/Vertex vision pass over sampled frames (or
+audio + written editorial rules in `highlight_vertex_audio_only` mode). Guards prevent
+common false positives: eco-round wins are re-verified by Gemini before qualifying, HUD
+misreads are clamped by `max_round_jump`, and a per-map cap keeps output volume editorial.
 
-Output folders are created under `output_root`:
+## Testing
 
-```text
-screens/        # temporary monitoring screenshots
-round_raw/      # 1920x1080 per-round recordings
-round_edited/   # portrait blur edits
-round_final/    # final captioned or ready-to-post videos
-meta/           # detection logs, result JSON, caption hook logs, state
+```powershell
+python -m unittest discover tests -v
 ```
 
-Start with `instagram_enabled: false` and an empty `caption_cmd_template`. After the raw and final videos look correct, test a caption hook that copies `{input}` to `{output}`, then swap in Riverside/local caption automation.
+Tests cover the deterministic core: demo-feature scoring and thresholds, LLM JSON
+repair/extraction (markdown fences, unquoted keys, trailing commas, truncated blobs),
+config time parsing, timeline slicing, SRT/ASS timestamp formatting, and caption line
+wrapping. Network, ffmpeg, and model calls are intentionally out of unit-test scope.
+
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — pipeline stages, data flow, failure handling
+- [docs/SETUP.md](docs/SETUP.md) — Windows / Docker setup, credentials, configuration reference
+- [docs/TOOLS.md](docs/TOOLS.md) — detailed CLI reference for every tool in the repo
+- [SECURITY.md](SECURITY.md) — secret handling policy
+- [CHANGELOG.md](CHANGELOG.md) — development history
+
+## License
+
+Proprietary — see [LICENSE](LICENSE). Evaluation for code review permitted; all other rights reserved.
