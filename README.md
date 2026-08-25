@@ -42,7 +42,8 @@ live stream ──▶ round detection ──▶ per-round recording ──▶ hi
 # 1. Environment (Windows; see docs/SETUP.md for Docker and details)
 python -m venv .venv
 .\.venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-lock.txt   # reproducible pinned install
+# (or `pip install -r requirements.txt` for loose latest-compatible versions)
 # ffmpeg + streamlink must be on PATH
 
 # 2. Credentials (never committed — see SECURITY.md)
