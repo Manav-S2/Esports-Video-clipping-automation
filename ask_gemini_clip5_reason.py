@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import re
+import time
 import zipfile
 from pathlib import Path
+
 from google import genai  # type: ignore
 
 from detect_cs2_highlight import (

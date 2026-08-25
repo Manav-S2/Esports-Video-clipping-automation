@@ -1,6 +1,8 @@
 import asyncio
-from playwright.async_api import async_playwright
+
 from loguru import logger
+from playwright.async_api import async_playwright
+
 
 async def riverside_caption_video(video_path: str, output_path: str):
     """
@@ -16,10 +18,10 @@ async def riverside_caption_video(video_path: str, output_path: str):
         try:
             logger.info("Navigating to Riverside.fm")
             await page.goto("https://riverside.fm/dashboard")
-            
+
             # Here you would typically handle login if not already logged in
             # For automation, you might want to load storage state (cookies)
-            
+
             # Check if we are on login page
             if "login" in page.url:
                 logger.warning("Need to login to Riverside.fm. Please login in the opened browser.")
@@ -33,26 +35,26 @@ async def riverside_caption_video(video_path: str, output_path: str):
             # 3. Wait for processing
             # 4. Go to Magic Editor / Captions
             # 5. Export/Download
-            
+
             # Note: Riverside's UI can be complex to automate perfectly without a stable API.
             # Usually, you'd find the 'Upload' button, input the file path into the hidden file input.
-            
+
             # Example (Hypothetical):
             # await page.click("text=Upload")
             # async with page.expect_file_chooser() as fc_info:
             #     await page.click("#upload-trigger")
             # file_chooser = await fc_info.value
             # await file_chooser.set_files(video_path)
-            
+
             logger.info("Waiting for processing and captions generation...")
             # ... wait logic ...
-            
+
             logger.info("Downloading captioned video")
             # ... download logic ...
-            
+
             # For now, we will simulate the "download" by copying if it was a real local tool
             # But since it's a web service, it would save to downloads folder.
-            
+
         except Exception as e:
             logger.error(f"Riverside automation failed: {e}")
         finally:

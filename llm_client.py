@@ -21,7 +21,7 @@ import ssl
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 
 def _make_ssl_context() -> ssl.SSLContext:
@@ -64,7 +64,7 @@ def _close_unbalanced_curly(s: str) -> str:
     return s
 
 
-def _extract_json(text: str) -> Dict[str, Any]:
+def _extract_json(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     # Gemini / Vertex often wrap JSON in markdown fences.
     if cleaned.startswith("```"):
@@ -116,7 +116,7 @@ def _file_data_url(path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def _json_post(url: str, api_key: str, payload: Dict[str, Any], timeout_sec: int = 120) -> Dict[str, Any]:
+def _json_post(url: str, api_key: str, payload: dict[str, Any], timeout_sec: int = 120) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -137,7 +137,7 @@ def _json_post(url: str, api_key: str, payload: Dict[str, Any], timeout_sec: int
     return json.loads(raw)
 
 
-def _chat_text(response: Dict[str, Any]) -> str:
+def _chat_text(response: dict[str, Any]) -> str:
     choices = response.get("choices", [])
     if not choices:
         return ""
@@ -146,7 +146,7 @@ def _chat_text(response: Dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        texts: List[str] = []
+        texts: list[str] = []
         for part in content:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
                 texts.append(part["text"])
@@ -218,7 +218,7 @@ def _is_retryable_urllib_failure(exc: BaseException) -> bool:
         return False
     if isinstance(exc, urllib.error.URLError):
         r = exc.reason
-        if isinstance(r, (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError)):
+        if isinstance(r, TimeoutError | socket.timeout | BrokenPipeError | ConnectionResetError):
             return True
         if isinstance(r, ConnectionError):
             return True
@@ -229,7 +229,7 @@ def _is_retryable_urllib_failure(exc: BaseException) -> bool:
         msg = str(exc).lower()
         if "timed out" in msg or "time out" in msg:
             return True
-    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+    if isinstance(exc, BrokenPipeError | ConnectionResetError):
         return True
     if isinstance(exc, OSError):
         msg = str(exc).lower()

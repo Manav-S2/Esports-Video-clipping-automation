@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from PIL import Image
 
@@ -19,13 +19,13 @@ from live_stream_highlight_pipeline import _extract_docx_text
 from llm_client import _chat_text, _extract_json, _file_data_url, _json_post
 
 
-def _run_ffmpeg(cmd: List[str]) -> None:
+def _run_ffmpeg(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {' '.join(cmd)}\n{proc.stderr}")
 
 
-def _extract_frames(clip: Path, frame_dir: Path, ffmpeg: str) -> List[Path]:
+def _extract_frames(clip: Path, frame_dir: Path, ffmpeg: str) -> list[Path]:
     pattern = frame_dir / "frame_%03d.jpg"
     cmd = [
         ffmpeg,
@@ -46,9 +46,9 @@ def _extract_frames(clip: Path, frame_dir: Path, ffmpeg: str) -> List[Path]:
     return sorted(frame_dir.glob("frame_*.jpg"))
 
 
-def _contact_sheet(frames: List[Path], out: Path) -> Path:
+def _contact_sheet(frames: list[Path], out: Path) -> Path:
     selected = frames[:6]
-    thumbs: List[Image.Image] = []
+    thumbs: list[Image.Image] = []
     for frame in selected:
         with Image.open(frame) as img:
             thumb = img.convert("RGB")
@@ -165,7 +165,7 @@ def main() -> int:
             f"{rules_text[:12000]}"
         )
 
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": args.model,
             "messages": [
                 {

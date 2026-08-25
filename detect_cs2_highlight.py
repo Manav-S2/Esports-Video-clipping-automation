@@ -26,10 +26,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 from video_editor import apply_portrait_blur
 
@@ -37,19 +38,19 @@ from video_editor import apply_portrait_blur
 @dataclass
 class DetectionResult:
     input_path: str
-    demos_analyzed: List[str]
+    demos_analyzed: list[str]
     score: float
     is_highlight: bool
     confidence: float
-    demo_score: Optional[float]
-    vision_score: Optional[float]
-    features: Dict[str, float]
-    vision: Dict[str, float]
-    rounds_scored: List[Dict[str, object]]
-    top_rounds: List[Dict[str, object]]
-    round_highlight_cutoffs: Dict[str, float]
-    highlight_round_details: List[Dict[str, Any]]
-    notes: List[str]
+    demo_score: float | None
+    vision_score: float | None
+    features: dict[str, float]
+    vision: dict[str, float]
+    rounds_scored: list[dict[str, object]]
+    top_rounds: list[dict[str, object]]
+    round_highlight_cutoffs: dict[str, float]
+    highlight_round_details: list[dict[str, Any]]
+    notes: list[str]
 
     def to_json(self) -> str:
         return json.dumps(
@@ -75,7 +76,7 @@ class DetectionResult:
         )
 
 
-def _pick_column(columns: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
+def _pick_column(columns: Iterable[str], candidates: Iterable[str]) -> str | None:
     column_map = {c.lower(): c for c in columns}
     for name in candidates:
         if name.lower() in column_map:
@@ -107,7 +108,7 @@ def _extract_demo_from_rar(rar_path: Path) -> Path:
     return demos[0]
 
 
-def _resolve_demo_paths(input_path: Path) -> List[Path]:
+def _resolve_demo_paths(input_path: Path) -> list[Path]:
     if input_path.is_dir():
         demos = sorted(input_path.glob("*.dem"), key=lambda p: p.stat().st_size, reverse=True)
         if not demos:
@@ -133,7 +134,7 @@ def _load_kill_events(demo_path: Path):
     parser = DemoParser(str(demo_path))
 
     # demoparser2 versions expose slightly different method names.
-    errors: List[str] = []
+    errors: list[str] = []
     for method_name in ("parse_event", "parse_events", "parse_ticks"):
         method = getattr(parser, method_name, None)
         if not method:
@@ -168,7 +169,7 @@ def _load_round_start_events(demo_path: Path):
         ) from exc
 
     parser = DemoParser(str(demo_path))
-    errors: List[str] = []
+    errors: list[str] = []
     for method_name in ("parse_event", "parse_events"):
         method = getattr(parser, method_name, None)
         if not method:
@@ -199,7 +200,7 @@ def _load_round_end_events(demo_path: Path):
         ) from exc
 
     parser = DemoParser(str(demo_path))
-    errors: List[str] = []
+    errors: list[str] = []
     for method_name in ("parse_event", "parse_events"):
         method = getattr(parser, method_name, None)
         if not method:
@@ -230,7 +231,7 @@ def _load_item_purchase_events(demo_path: Path):
         ) from exc
 
     parser = DemoParser(str(demo_path))
-    errors: List[str] = []
+    errors: list[str] = []
     for method_name in ("parse_event", "parse_events"):
         method = getattr(parser, method_name, None)
         if not method:
@@ -265,7 +266,7 @@ def _load_team_ticks(demo_path: Path):
 
 
 def _normalize_kill_time_column(kills_df):
-    notes: List[str] = []
+    notes: list[str] = []
     if kills_df is None or len(kills_df) == 0:
         return kills_df, notes
 
@@ -290,7 +291,7 @@ def _assign_round_numbers(kills_df, round_start_df):
     if kills_df is None or len(kills_df) == 0:
         return kills_df, ["No kill events available for round assignment."]
 
-    notes: List[str] = []
+    notes: list[str] = []
     if round_start_df is None or len(round_start_df) == 0:
         notes.append("No round_start events found; round-by-round scoring disabled.")
         return kills_df, notes
@@ -329,8 +330,8 @@ def _assign_round_numbers(kills_df, round_start_df):
     return merged, notes
 
 
-def _compute_features(kills_df) -> Tuple[Dict[str, float], List[str]]:
-    notes: List[str] = []
+def _compute_features(kills_df) -> tuple[dict[str, float], list[str]]:
+    notes: list[str] = []
 
     if kills_df is None or len(kills_df) == 0:
         return {
@@ -344,7 +345,7 @@ def _compute_features(kills_df) -> Tuple[Dict[str, float], List[str]]:
     columns = list(kills_df.columns)
 
     attacker_col = _pick_column(columns, ["attacker_name", "attacker", "killer_name", "killer"])
-    time_col = _pick_column(columns, ["_time_seconds", "time", "seconds", "game_time", "clock_time", "tick"]) 
+    time_col = _pick_column(columns, ["_time_seconds", "time", "seconds", "game_time", "clock_time", "tick"])
     hs_col = _pick_column(columns, ["is_headshot", "headshot", "head_shot"])
 
     kills_total = float(len(kills_df))
@@ -406,7 +407,7 @@ def _compute_features(kills_df) -> Tuple[Dict[str, float], List[str]]:
     return features, notes
 
 
-def _score_demo_highlight(features: Dict[str, float]) -> Tuple[float, bool, float]:
+def _score_demo_highlight(features: dict[str, float]) -> tuple[float, bool, float]:
     # Weighted heuristic tuned for quick highlight screening.
     score = 0.0
     score += min(features["kills_total"], 12.0) * 0.55
@@ -424,8 +425,8 @@ def _score_demo_highlight(features: Dict[str, float]) -> Tuple[float, bool, floa
     return score, is_highlight, confidence
 
 
-def _score_rounds(kills_df, demo_name: str) -> Tuple[List[Dict[str, object]], List[str]]:
-    notes: List[str] = []
+def _score_rounds(kills_df, demo_name: str) -> tuple[list[dict[str, object]], list[str]]:
+    notes: list[str] = []
     if kills_df is None or len(kills_df) == 0:
         return [], [f"{demo_name}: No kills available for round scoring."]
 
@@ -439,7 +440,7 @@ def _score_rounds(kills_df, demo_name: str) -> Tuple[List[Dict[str, object]], Li
     wipe_col = _pick_column(columns, ["wipe"])
     round_end_reason_col = _pick_column(columns, ["_round_end_reason"])
 
-    round_rows: List[Dict[str, object]] = []
+    round_rows: list[dict[str, object]] = []
     for round_num, grp in kills_df.groupby("_round_number"):
         if int(round_num) <= 0:
             continue
@@ -517,7 +518,7 @@ def _score_rounds(kills_df, demo_name: str) -> Tuple[List[Dict[str, object]], Li
     return round_rows, notes
 
 
-def _map_score_from_rounds(round_rows: Sequence[Dict[str, object]]) -> Optional[float]:
+def _map_score_from_rounds(round_rows: Sequence[dict[str, object]]) -> float | None:
     if not round_rows:
         return None
     ordered = sorted(round_rows, key=lambda r: float(r["round_score"]), reverse=True)
@@ -527,8 +528,8 @@ def _map_score_from_rounds(round_rows: Sequence[Dict[str, object]]) -> Optional[
     return sum(float(r["round_score"]) for r in top_n) / len(top_n)
 
 
-def _build_round_bounds_seconds(round_start_df, round_end_df) -> Dict[int, Tuple[float, float]]:
-    bounds: Dict[int, Tuple[float, float]] = {}
+def _build_round_bounds_seconds(round_start_df, round_end_df) -> dict[int, tuple[float, float]]:
+    bounds: dict[int, tuple[float, float]] = {}
     if round_start_df is None or len(round_start_df) == 0:
         return bounds
 
@@ -538,20 +539,20 @@ def _build_round_bounds_seconds(round_start_df, round_end_df) -> Dict[int, Tuple
     if not rs_tick_col or not rs_round_col:
         return bounds
 
-    starts: Dict[int, float] = {}
-    for r, t in zip(round_start_df[rs_round_col].tolist(), round_start_df[rs_tick_col].tolist()):
+    starts: dict[int, float] = {}
+    for r, t in zip(round_start_df[rs_round_col].tolist(), round_start_df[rs_tick_col].tolist(), strict=False):
         rn = int(r)
         ts = float(t) / 64.0
         if rn not in starts or ts < starts[rn]:
             starts[rn] = ts
 
-    ends: Dict[int, float] = {}
+    ends: dict[int, float] = {}
     if round_end_df is not None and len(round_end_df) > 0:
         re_cols = list(round_end_df.columns)
         re_tick_col = _pick_column(re_cols, ["tick"])
         re_round_col = _pick_column(re_cols, ["round", "round_num", "round_number"])
         if re_tick_col and re_round_col:
-            for r, t in zip(round_end_df[re_round_col].tolist(), round_end_df[re_tick_col].tolist()):
+            for r, t in zip(round_end_df[re_round_col].tolist(), round_end_df[re_tick_col].tolist(), strict=False):
                 ends[int(r)] = float(t) / 64.0
 
     sorted_rounds = sorted(starts.keys())
@@ -569,9 +570,9 @@ def _build_round_bounds_seconds(round_start_df, round_end_df) -> Dict[int, Tuple
     return bounds
 
 
-def _infer_eco_loss_rounds(demo_path: Path, round_start_df, round_end_df) -> Dict[int, Dict[str, Any]]:
+def _infer_eco_loss_rounds(demo_path: Path, round_start_df, round_end_df) -> dict[int, dict[str, Any]]:
     """Heuristic eco-loss detector using purchase spend on losing side per round."""
-    info: Dict[int, Dict[str, Any]] = {}
+    info: dict[int, dict[str, Any]] = {}
     try:
         import pandas as pd  # type: ignore
     except Exception:
@@ -651,13 +652,13 @@ def _infer_eco_loss_rounds(demo_path: Path, round_start_df, round_end_df) -> Dic
     p = pd.concat(merged_parts, ignore_index=True) if merged_parts else p
 
     # Determine losing side by round from round_end winner side.
-    loser_by_round: Dict[int, str] = {}
+    loser_by_round: dict[int, str] = {}
     if round_end_df is not None and len(round_end_df) > 0:
         re_cols = list(round_end_df.columns)
         re_round_col = _pick_column(re_cols, ["round", "round_num", "round_number"])
         re_winner_col = _pick_column(re_cols, ["winner"])
         if re_round_col and re_winner_col:
-            for r, w in zip(round_end_df[re_round_col].tolist(), round_end_df[re_winner_col].tolist()):
+            for r, w in zip(round_end_df[re_round_col].tolist(), round_end_df[re_winner_col].tolist(), strict=False):
                 winner = str(w).upper()
                 loser = "CT" if winner == "T" else "TERRORIST"
                 loser_by_round[int(r)] = loser
@@ -691,7 +692,7 @@ def _infer_eco_loss_rounds(demo_path: Path, round_start_df, round_end_df) -> Dic
     return info
 
 
-def _extract_interval_frames(video_path: Path, out_dir: Path, start_sec: float, end_sec: float, max_frames: int) -> List[Path]:
+def _extract_interval_frames(video_path: Path, out_dir: Path, start_sec: float, end_sec: float, max_frames: int) -> list[Path]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not available in PATH.")
@@ -735,16 +736,16 @@ def _extract_interval_frames(video_path: Path, out_dir: Path, start_sec: float, 
 
 def _gemini_confirm_exceptional_round(
     video_path: Path,
-    api_key: Optional[str],
+    api_key: str | None,
     model: str,
     start_sec: float,
     end_sec: float,
     ai_backend: str,
-    vertex_project_id: Optional[str],
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
+    vertex_api_key: str | None,
     max_frames: int = 6,
-) -> Tuple[bool, str, float]:
+) -> tuple[bool, str, float]:
     with tempfile.TemporaryDirectory(prefix="gemini_round_check_") as td:
         frames = _extract_interval_frames(video_path, Path(td), start_sec, end_sec, max_frames=max_frames)
         if not frames:
@@ -774,21 +775,21 @@ def _gemini_confirm_exceptional_round(
 
 
 def _apply_eco_guard_with_gemini(
-    rounds_scored: Sequence[Dict[str, object]],
-    eco_info_by_demo: Dict[str, Dict[int, Dict[str, Any]]],
-    round_bounds_by_demo: Dict[str, Dict[int, Tuple[float, float]]],
-    video_path: Optional[Path],
-    gemini_api_key: Optional[str],
+    rounds_scored: Sequence[dict[str, object]],
+    eco_info_by_demo: dict[str, dict[int, dict[str, Any]]],
+    round_bounds_by_demo: dict[str, dict[int, tuple[float, float]]],
+    video_path: Path | None,
+    gemini_api_key: str | None,
     gemini_model: str,
     ai_backend: str,
-    vertex_project_id: Optional[str],
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
+    vertex_api_key: str | None,
     clip_start_demo_seconds: float,
     video_duration_seconds: float,
-) -> Tuple[List[Dict[str, object]], List[str]]:
-    notes: List[str] = []
-    updated: List[Dict[str, object]] = []
+) -> tuple[list[dict[str, object]], list[str]]:
+    notes: list[str] = []
+    updated: list[dict[str, object]] = []
 
     for row in rounds_scored:
         r = dict(row)
@@ -867,22 +868,22 @@ def _apply_eco_guard_with_gemini(
 
 
 def _apply_per_map_highlight_cap(
-    round_rows: Sequence[Dict[str, object]],
+    round_rows: Sequence[dict[str, object]],
     max_highlights_per_map: int,
-) -> Tuple[List[Dict[str, object]], Dict[str, float], List[str]]:
-    notes: List[str] = []
+) -> tuple[list[dict[str, object]], dict[str, float], list[str]]:
+    notes: list[str] = []
     if max_highlights_per_map <= 0:
         return [dict(r, is_round_highlight=False) for r in round_rows], {}, [
             "max_highlights_per_map <= 0, so no rounds are marked as highlights."
         ]
 
-    by_demo: Dict[str, List[Dict[str, object]]] = {}
+    by_demo: dict[str, list[dict[str, object]]] = {}
     for row in round_rows:
         demo = str(row.get("demo", "unknown"))
         by_demo.setdefault(demo, []).append(dict(row))
 
-    cutoffs: Dict[str, float] = {}
-    updated: List[Dict[str, object]] = []
+    cutoffs: dict[str, float] = {}
+    updated: list[dict[str, object]] = []
 
     for demo, rows in by_demo.items():
         ordered = sorted(rows, key=lambda r: float(r["round_score"]), reverse=True)
@@ -902,9 +903,9 @@ def _apply_per_map_highlight_cap(
 
 
 def _apply_attention_gate(
-    rounds_scored: Sequence[Dict[str, object]],
-    kill_events_by_demo_round: Dict[str, Dict[int, List[Dict[str, Any]]]],
-) -> Tuple[List[Dict[str, object]], List[str]]:
+    rounds_scored: Sequence[dict[str, object]],
+    kill_events_by_demo_round: dict[str, dict[int, list[dict[str, Any]]]],
+) -> tuple[list[dict[str, object]], list[str]]:
     """Block low-attention rounds unless they show standout highlight traits.
 
     Allowed traits (any one is enough):
@@ -914,8 +915,8 @@ def _apply_attention_gate(
     - deagle/r8 highlight kill
     - flick/quick-scope cue inferred by event flags (best-effort)
     """
-    notes: List[str] = []
-    updated: List[Dict[str, object]] = []
+    notes: list[str] = []
+    updated: list[dict[str, object]] = []
 
     blocked = 0
     for row in rounds_scored:
@@ -966,7 +967,7 @@ def _apply_attention_gate(
     return updated, notes
 
 
-def _extract_sample_frames(video_path: Path, out_dir: Path, sample_seconds: float, max_frames: int) -> List[Path]:
+def _extract_sample_frames(video_path: Path, out_dir: Path, sample_seconds: float, max_frames: int) -> list[Path]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not available in PATH.")
@@ -1001,7 +1002,7 @@ def _extract_sample_frames(video_path: Path, out_dir: Path, sample_seconds: floa
     frames = sorted(out_dir.glob("frame_*.jpg"))
     if len(frames) > max_frames:
         step = len(frames) / float(max_frames)
-        sampled: List[Path] = []
+        sampled: list[Path] = []
         idx = 0.0
         while len(sampled) < max_frames and int(idx) < len(frames):
             sampled.append(frames[int(idx)])
@@ -1010,7 +1011,7 @@ def _extract_sample_frames(video_path: Path, out_dir: Path, sample_seconds: floa
     return frames
 
 
-def _extract_json_block(text: str) -> Dict[str, object]:
+def _extract_json_block(text: str) -> dict[str, object]:
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         raise RuntimeError("Gemini response did not contain JSON.")
@@ -1019,9 +1020,9 @@ def _extract_json_block(text: str) -> Dict[str, object]:
 
 def _vision_backend_available(
     ai_backend: str,
-    gemini_api_key: Optional[str],
-    vertex_project_id: Optional[str],
-    vertex_api_key: Optional[str],
+    gemini_api_key: str | None,
+    vertex_project_id: str | None,
+    vertex_api_key: str | None,
 ) -> bool:
     if ai_backend == "vertex":
         return bool(vertex_project_id or vertex_api_key)
@@ -1033,11 +1034,11 @@ def _generate_multimodal_json(
     image_paths: Sequence[Path],
     ai_backend: str,
     model: str,
-    gemini_api_key: Optional[str],
-    vertex_project_id: Optional[str],
+    gemini_api_key: str | None,
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
-) -> Dict[str, object]:
+    vertex_api_key: str | None,
+) -> dict[str, object]:
     if ai_backend == "vertex" and vertex_api_key:
         if not vertex_project_id:
             raise RuntimeError("Vertex API key mode requires --vertex-project-id.")
@@ -1055,7 +1056,7 @@ def _generate_multimodal_json(
             )
         endpoint = f"{endpoint}?key={urllib.parse.quote(vertex_api_key)}"
 
-        parts: List[Dict[str, Any]] = [{"text": prompt}]
+        parts: list[dict[str, Any]] = [{"text": prompt}]
         for image_path in image_paths:
             parts.append(
                 {
@@ -1091,7 +1092,7 @@ def _generate_multimodal_json(
             raise RuntimeError(f"Vertex API key request failed: {exc}") from exc
 
         data = json.loads(body)
-        text_parts: List[str] = []
+        text_parts: list[str] = []
         for cand in data.get("candidates", []):
             content = cand.get("content", {}) if isinstance(cand, dict) else {}
             for part in content.get("parts", []) if isinstance(content, dict) else []:
@@ -1111,7 +1112,7 @@ def _generate_multimodal_json(
         ) from exc
 
     if ai_backend == "vertex":
-        client_kwargs: Dict[str, Any] = {"vertexai": True}
+        client_kwargs: dict[str, Any] = {"vertexai": True}
         if vertex_api_key:
             client_kwargs["api_key"] = vertex_api_key
             client_kwargs["location"] = vertex_location
@@ -1130,7 +1131,7 @@ def _generate_multimodal_json(
             raise RuntimeError("Gemini backend requires --gemini-api-key or GEMINI_API_KEY.")
         client = genai_sdk.Client(api_key=gemini_api_key)
 
-    contents: List[object] = [prompt]
+    contents: list[object] = [prompt]
     for image_path in image_paths:
         contents.append(
             genai_types.Part.from_bytes(
@@ -1169,15 +1170,15 @@ def _get_video_duration_seconds(video_path: Path) -> float:
 
 def _score_vision_with_gemini(
     video_path: Path,
-    api_key: Optional[str],
+    api_key: str | None,
     model: str,
     sample_seconds: float,
     max_frames: int,
     ai_backend: str,
-    vertex_project_id: Optional[str],
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
-) -> Tuple[Dict[str, float], List[str]]:
+    vertex_api_key: str | None,
+) -> tuple[dict[str, float], list[str]]:
     with tempfile.TemporaryDirectory(prefix="gemini_frames_") as td:
         frames = _extract_sample_frames(video_path, Path(td), sample_seconds, max_frames)
         if not frames:
@@ -1220,7 +1221,7 @@ def _score_vision_with_gemini(
         return vision, notes
 
 
-def _collect_round_kill_events(kills_df) -> Dict[int, List[Dict[str, Any]]]:
+def _collect_round_kill_events(kills_df) -> dict[int, list[dict[str, Any]]]:
     if kills_df is None or len(kills_df) == 0 or "_round_number" not in kills_df.columns:
         return {}
 
@@ -1236,7 +1237,7 @@ def _collect_round_kill_events(kills_df) -> Dict[int, List[Dict[str, Any]]]:
     blind_col = _pick_column(columns, ["attackerblind"])
     air_col = _pick_column(columns, ["attackerinair"])
 
-    rows: Dict[int, List[Dict[str, Any]]] = {}
+    rows: dict[int, list[dict[str, Any]]] = {}
     for _, row in kills_df.iterrows():
         rnd = int(row.get("_round_number", 0))
         if rnd <= 0:
@@ -1282,17 +1283,17 @@ def _extract_single_frame(video_path: Path, timestamp_sec: float, out_path: Path
 
 def _gemini_round_visual_feedback(
     video_path: Path,
-    api_key: Optional[str],
+    api_key: str | None,
     model: str,
-    round_events: List[Dict[str, Any]],
+    round_events: list[dict[str, Any]],
     clip_start_demo_seconds: float,
     video_duration_seconds: float,
     ai_backend: str,
-    vertex_project_id: Optional[str],
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
+    vertex_api_key: str | None,
     max_frames: int = 4,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # Prioritize visually notable events.
     scored = []
     for e in round_events:
@@ -1315,7 +1316,7 @@ def _gemini_round_visual_feedback(
 
     with tempfile.TemporaryDirectory(prefix="round_visual_feedback_") as td:
         td_path = Path(td)
-        frame_files: List[Path] = []
+        frame_files: list[Path] = []
         for i, e in enumerate(chosen, 1):
             demo_t = float(e.get("time_seconds", 0.0))
             clip_t = demo_t - clip_start_demo_seconds
@@ -1385,12 +1386,12 @@ def _gemini_round_visual_feedback(
 
 
 def _combine_scores(
-    demo_score: Optional[float],
-    vision_score: Optional[float],
+    demo_score: float | None,
+    vision_score: float | None,
     demo_weight: float,
     vision_weight: float,
-) -> Tuple[float, bool, float, List[str]]:
-    notes: List[str] = []
+) -> tuple[float, bool, float, list[str]]:
+    notes: list[str] = []
 
     if demo_score is None and vision_score is None:
         return 0.0, False, 0.0, ["No scoring sources were available."]
@@ -1417,14 +1418,14 @@ def _combine_scores(
 
 
 def detect_highlight(
-    demo_input: Optional[Path],
-    video_path: Optional[Path],
-    gemini_api_key: Optional[str],
+    demo_input: Path | None,
+    video_path: Path | None,
+    gemini_api_key: str | None,
     gemini_model: str,
     ai_backend: str,
-    vertex_project_id: Optional[str],
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
+    vertex_api_key: str | None,
     sample_seconds: float,
     max_frames: int,
     demo_weight: float,
@@ -1434,30 +1435,30 @@ def detect_highlight(
     clip_start_demo_seconds: float,
     visual_feedback_max_rounds: int,
 ) -> DetectionResult:
-    notes: List[str] = []
-    demos: List[Path] = []
+    notes: list[str] = []
+    demos: list[Path] = []
 
-    demo_score: Optional[float] = None
-    demo_features: Dict[str, float] = {
+    demo_score: float | None = None
+    demo_features: dict[str, float] = {
         "kills_total": 0.0,
         "kills_per_minute": 0.0,
         "headshot_ratio": 0.0,
         "multi_kill_burst_score": 0.0,
         "unique_killers": 0.0,
     }
-    rounds_scored: List[Dict[str, object]] = []
-    round_highlight_cutoffs: Dict[str, float] = {}
-    eco_info_by_demo: Dict[str, Dict[int, Dict[str, Any]]] = {}
-    round_bounds_by_demo: Dict[str, Dict[int, Tuple[float, float]]] = {}
-    kill_events_by_demo_round: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
+    rounds_scored: list[dict[str, object]] = []
+    round_highlight_cutoffs: dict[str, float] = {}
+    eco_info_by_demo: dict[str, dict[int, dict[str, Any]]] = {}
+    round_bounds_by_demo: dict[str, dict[int, tuple[float, float]]] = {}
+    kill_events_by_demo_round: dict[str, dict[int, list[dict[str, Any]]]] = {}
 
     if demo_input is not None:
         if not demo_input.exists():
             raise FileNotFoundError(f"Demo input not found: {demo_input}")
 
         demos = _resolve_demo_paths(demo_input)
-        map_scores: List[float] = []
-        map_feature_list: List[Dict[str, float]] = []
+        map_scores: list[float] = []
+        map_feature_list: list[dict[str, float]] = []
         for demo in demos:
             kills_df = _load_kill_events(demo)
             round_start_df = _load_round_start_events(demo)
@@ -1481,7 +1482,7 @@ def detect_highlight(
                 if re_round_col and re_reason_col:
                     reason_map = {
                         int(r): str(v)
-                        for r, v in zip(round_end_df[re_round_col].tolist(), round_end_df[re_reason_col].tolist())
+                        for r, v in zip(round_end_df[re_round_col].tolist(), round_end_df[re_reason_col].tolist(), strict=False)
                     }
                     kills_df = kills_df.copy()
                     kills_df["_round_end_reason"] = kills_df["_round_number"].map(reason_map)
@@ -1508,7 +1509,7 @@ def detect_highlight(
             for k in keys:
                 demo_features[k] = sum(m[k] for m in map_feature_list) / len(map_feature_list)
 
-    vision: Dict[str, float] = {
+    vision: dict[str, float] = {
         "vision_score": 0.0,
         "confidence": 0.0,
         "action_intensity": 0.0,
@@ -1516,7 +1517,7 @@ def detect_highlight(
         "clutch_or_multikill_cues": 0.0,
         "broadcast_hype_cues": 0.0,
     }
-    vision_score: Optional[float] = None
+    vision_score: float | None = None
     if video_path is not None:
         if not video_path.exists():
             raise FileNotFoundError(f"Video path not found: {video_path}")
@@ -1586,12 +1587,12 @@ def detect_highlight(
     notes.extend(attention_notes)
 
     # Add per-round event mapping and optional Gemini visual feedback.
-    highlight_round_details: List[Dict[str, Any]] = []
+    highlight_round_details: list[dict[str, Any]] = []
     visual_review_budget = max(0, int(visual_feedback_max_rounds))
     for r in sorted(rounds_scored, key=lambda x: float(x["round_score"]), reverse=True):
         if not bool(r.get("is_round_highlight", False)):
             continue
-        detail: Dict[str, Any] = {
+        detail: dict[str, Any] = {
             "demo": r.get("demo", ""),
             "round": int(r.get("round", 0)),
             "round_score": float(r.get("round_score", 0.0)),
@@ -1669,11 +1670,11 @@ def _generate_text_json(
     prompt: str,
     ai_backend: str,
     model: str,
-    gemini_api_key: Optional[str],
-    vertex_project_id: Optional[str],
+    gemini_api_key: str | None,
+    vertex_project_id: str | None,
     vertex_location: str,
-    vertex_api_key: Optional[str],
-) -> Dict[str, Any]:
+    vertex_api_key: str | None,
+) -> dict[str, Any]:
     """Generates a JSON response from a text-only prompt."""
     if ai_backend == "vertex" and vertex_api_key:
         if not vertex_project_id:
@@ -1697,8 +1698,8 @@ def _generate_text_json(
 
     try:
         from google import genai as genai_sdk
-    except ImportError:
-        raise RuntimeError("google-genai is not installed.")
+    except ImportError as exc:
+        raise RuntimeError("google-genai is not installed.") from exc
 
     if ai_backend == "vertex":
         client = genai_sdk.Client(vertexai=True, project=vertex_project_id, location=vertex_location)
@@ -1716,12 +1717,12 @@ class LiveStreamMonitor:
         self.api_key = args.gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.model = args.gemini_model
         self.backend = args.ai_backend
-        
+
         self.output_root = Path(args.output_dir or "live_pipeline_output")
         self.screens_dir = self.output_root / "screenshots"
         self.clips_dir = self.output_root / "raw_clips"
         self.processed_dir = self.output_root / "processed"
-        
+
         for d in [self.screens_dir, self.clips_dir, self.processed_dir]:
             d.mkdir(parents=True, exist_ok=True)
 
@@ -1737,7 +1738,7 @@ class LiveStreamMonitor:
                 return res.stdout.strip()
         return self.stream_url
 
-    def capture_screenshot(self) -> Optional[Path]:
+    def capture_screenshot(self) -> Path | None:
         path = self.screens_dir / f"live_{int(time.time())}.jpg"
         stream = self._resolve_stream()
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", stream, "-frames:v", "1", "-q:v", "2", str(path)]
@@ -1745,7 +1746,7 @@ class LiveStreamMonitor:
             return path
         return None
 
-    def detect_round(self, image_path: Path) -> Optional[int]:
+    def detect_round(self, image_path: Path) -> int | None:
         prompt = (
             "Analyze this CS2 stream screenshot. Identify the current round number from the HUD. "
             "Return ONLY a JSON object: {\"round\": number_or_null}"
@@ -1765,7 +1766,7 @@ class LiveStreamMonitor:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.recording_path = self.clips_dir / f"round_{round_num}_{timestamp}.mp4"
         stream = self._resolve_stream()
-        
+
         # Record at 1080p
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", stream,
@@ -1788,7 +1789,7 @@ class LiveStreamMonitor:
 
     def process_clip(self, clip_path: Path, round_num: int):
         print(f"Analyzing Round {round_num} for highlights...")
-        
+
         # 1. Classify Highlight via Gemini
         prompt = (
             "Is this CS2 round a highlight? Look for multi-kills, clutches, or exceptional aim. "
@@ -1838,7 +1839,7 @@ class LiveStreamMonitor:
         if self.args.instagram_post:
             self.post_to_instagram(captioned_path, analysis)
 
-    def post_to_instagram(self, video_path: Path, meta: Dict[str, Any]):
+    def post_to_instagram(self, video_path: Path, meta: dict[str, Any]):
         print(f"Posting to Instagram: {video_path.name}")
         # Note: Requires instagrapi
         try:
@@ -1864,14 +1865,14 @@ class LiveStreamMonitor:
                     if shot:
                         round_num = self.detect_round(shot)
                         shot.unlink() # Cleanup
-                        
+
                         if round_num is not None:
                             if self.current_round is None:
                                 self.start_recording(round_num)
                             elif round_num > self.current_round:
                                 self.stop_recording()
                                 self.start_recording(round_num)
-                        
+
                 time.sleep(0.5)
         except KeyboardInterrupt:
             self.stop_recording()

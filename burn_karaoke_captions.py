@@ -26,16 +26,16 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 
-def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
+def _speech_api_key_local_paths(config_path: Path) -> list[Path]:
     """Locate ``speech_api_key.local.json`` for mono-repo layouts (CAPTIONS vs Esports config paths)."""
 
     cfg_dir = config_path.resolve().parent
     grand = cfg_dir.parent
     seen_keys: set[str] = set()
-    out: List[Path] = []
+    out: list[Path] = []
     for p in (
         cfg_dir / "speech_api_key.local.json",
         grand / "Esports-Video-clipping-automation" / "speech_api_key.local.json",
@@ -49,7 +49,7 @@ def _speech_api_key_local_paths(config_path: Path) -> List[Path]:
     return out
 
 
-def _resolve_speech_api_key(cfg: Dict[str, Any], config_path: Path) -> str:
+def _resolve_speech_api_key(cfg: dict[str, Any], config_path: Path) -> str:
     env_k = os.getenv("GOOGLE_SPEECH_API_KEY", "").strip()
     if env_k:
         return env_k
@@ -205,7 +205,7 @@ def main() -> int:
     if not cfg_path.is_file():
         print(f"[karaoke] config not found: {cfg_path}", file=sys.stderr)
         return 2
-    cfg: Dict[str, Any] = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg: dict[str, Any] = json.loads(cfg_path.read_text(encoding="utf-8"))
 
     if args.speech_recognition_timeout_sec is not None:
         speech_timeout = float(args.speech_recognition_timeout_sec)

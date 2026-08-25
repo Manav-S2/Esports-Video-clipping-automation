@@ -1,7 +1,8 @@
+import os
 import subprocess
 import time
-import os
 from datetime import datetime
+
 
 def capture_screenshots(twitch_url, output_dir="every_second_screenshots", interval_seconds=2):
     """
@@ -54,7 +55,7 @@ def capture_screenshots(twitch_url, output_dir="every_second_screenshots", inter
                 "-q:v", "2",
                 output_filepath
             ]
-            
+
             try:
                 subprocess.run(ffmpeg_command, check=True, capture_output=True)
                 print(f"Captured {output_filepath}")
@@ -76,6 +77,6 @@ if __name__ == "__main__":
     TWITCH_URL = "https://www.twitch.tv/fooya"
     SCREENSHOT_INTERVAL = 2  # seconds
     # The output directory will be created relative to where this script is run
-    OUTPUT_DIRECTORY = "every_second_screenshots" 
-    
+    OUTPUT_DIRECTORY = "every_second_screenshots"
+
     capture_screenshots(TWITCH_URL, OUTPUT_DIRECTORY, SCREENSHOT_INTERVAL)

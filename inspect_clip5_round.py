@@ -4,17 +4,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 from detect_cs2_highlight import (
+    _apply_per_map_highlight_cap,
+    _assign_round_numbers,
     _extract_sample_frames,
     _generate_multimodal_json,
     _load_kill_events,
     _load_round_start_events,
     _normalize_kill_time_column,
-    _assign_round_numbers,
     _score_rounds,
-    _apply_per_map_highlight_cap,
 )
 
 
@@ -22,8 +22,8 @@ def _canon(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
 
 
-def _collect_round_kill_pairs(kills_df) -> Dict[int, List[Tuple[str, str]]]:
-    pairs: Dict[int, List[Tuple[str, str]]] = {}
+def _collect_round_kill_pairs(kills_df) -> dict[int, list[tuple[str, str]]]:
+    pairs: dict[int, list[tuple[str, str]]] = {}
     if kills_df is None or len(kills_df) == 0 or "_round_number" not in kills_df.columns:
         return pairs
 
@@ -52,7 +52,7 @@ def _collect_round_kill_pairs(kills_df) -> Dict[int, List[Tuple[str, str]]]:
     return pairs
 
 
-def _extract_clip_observations(clip_path: Path, key: str, project_id: str, location: str, model: str) -> Dict[str, Any]:
+def _extract_clip_observations(clip_path: Path, key: str, project_id: str, location: str, model: str) -> dict[str, Any]:
     tmp = clip_path.parent / "_tmp_clip5_frames"
     if tmp.exists():
         for p in tmp.glob("*.jpg"):
@@ -109,7 +109,7 @@ def main() -> int:
 
     obs = _extract_clip_observations(clip, key, project, location, model)
 
-    observed_pairs: List[Tuple[str, str]] = []
+    observed_pairs: list[tuple[str, str]] = []
     for e in obs.get("events", []) if isinstance(obs, dict) else []:
         if not isinstance(e, dict):
             continue
@@ -117,8 +117,8 @@ def main() -> int:
 
     map_guess = _canon(str(obs.get("map_guess", ""))) if isinstance(obs, dict) else ""
 
-    candidates: List[Dict[str, Any]] = []
-    round_rows_all: List[Dict[str, object]] = []
+    candidates: list[dict[str, Any]] = []
+    round_rows_all: list[dict[str, object]] = []
 
     for demo in sorted(demo_dir.glob("*.dem")):
         kills_df = _load_kill_events(demo)
