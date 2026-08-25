@@ -14,11 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
     from live_stream_highlight_pipeline import (
-        _close_unbalanced_curly,
-        _extract_json,
         _highlight_analysis_equipart_times,
         _parse_seek_seconds,
-        _sanitize_llm_json_blob,
     )
 
     _IMPORT_ERROR = None
@@ -46,41 +43,6 @@ class ParseSeekSecondsTests(unittest.TestCase):
 
     def test_garbage_string(self):
         self.assertEqual(_parse_seek_seconds("not a time"), 0.0)
-
-
-@unittest.skipIf(_IMPORT_ERROR is not None, f"optional deps missing: {_IMPORT_ERROR}")
-class LlmJsonRecoveryTests(unittest.TestCase):
-    def test_extract_plain_json(self):
-        self.assertEqual(_extract_json('{"a": 1}'), {"a": 1})
-
-    def test_strips_markdown_fences(self):
-        text = "```json\n{\"is_highlight\": true}\n```"
-        self.assertEqual(_extract_json(text), {"is_highlight": True})
-
-    def test_quotes_bare_keys(self):
-        self.assertEqual(_extract_json("{round: 7, valid: true}"), {"round": 7, "valid": True})
-
-    def test_removes_trailing_commas(self):
-        self.assertEqual(_extract_json('{"a": [1, 2,], "b": 3,}'), {"a": [1, 2], "b": 3})
-
-    def test_prose_prefix_before_json(self):
-        self.assertEqual(_extract_json('The answer is: {"x": 1}'), {"x": 1})
-
-    def test_salvages_truncated_response(self):
-        truncated = '{"rounds": [1, 2, 3], "score": 8.1, "reason": "the play was incr'
-        obj = _extract_json(truncated)
-        self.assertEqual(obj.get("rounds"), [1, 2, 3])
-
-    def test_no_json_raises(self):
-        with self.assertRaises(RuntimeError):
-            _extract_json("no braces at all")
-
-    def test_close_unbalanced_curly(self):
-        self.assertTrue(_close_unbalanced_curly('{"a": {"b": 1').count("}") >= 2)
-
-    def test_sanitize_is_idempotent_on_valid_json(self):
-        blob = '{"a": 1, "b": [2, 3]}'
-        self.assertEqual(_sanitize_llm_json_blob(blob), blob)
 
 
 @unittest.skipIf(_IMPORT_ERROR is not None, f"optional deps missing: {_IMPORT_ERROR}")

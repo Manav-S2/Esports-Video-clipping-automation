@@ -15,13 +15,8 @@ from typing import Any, Dict, List
 
 from PIL import Image
 
-from live_stream_highlight_pipeline import (
-    _chat_text,
-    _extract_docx_text,
-    _extract_json,
-    _file_data_url,
-    _json_post,
-)
+from live_stream_highlight_pipeline import _extract_docx_text
+from llm_client import _chat_text, _extract_json, _file_data_url, _json_post
 
 
 def _run_ffmpeg(cmd: List[str]) -> None:
