@@ -22,7 +22,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import signal
 import time
 import urllib.error
 import urllib.parse

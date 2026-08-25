@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        # The unit suite covers pure logic only; media/SDK deps are not required.
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests
+        run: python -m unittest discover tests -v
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit against requirements
+        # Non-blocking: reports known vulnerabilities in pinned deps without
+        # failing the build on advisories in transitive media libraries.
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt

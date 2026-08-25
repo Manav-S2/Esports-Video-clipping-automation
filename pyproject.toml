@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["streamlink_portable", "CAPTIONS", "live_pipeline_output"]
+
+[tool.ruff.lint]
+# Correctness-focused gate: syntax errors, undefined names, misused f-strings/asserts.
+# Style rules are intentionally out of scope for the CI gate.
+select = ["E9", "F63", "F7", "F82", "F401"]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports kept for backwards compatibility live in __init__ and orchestrator modules.
+"tests/*" = ["F401"]
