@@ -84,7 +84,7 @@ misreads are clamped by `max_round_jump`, and a per-map cap keeps output volume 
 ## Testing
 
 ```powershell
-python -m unittest discover tests -v
+python -m pytest            # or: python -m unittest discover tests -v
 ```
 
 Tests cover the deterministic core: demo-feature scoring and thresholds, LLM JSON
