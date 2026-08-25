@@ -1,5 +1,9 @@
 # Esports Video Clipping Automation
 
+> **Project type:** Python application pipeline (media automation / applied ML).
+> The Dockerfile and docker-compose here are application packaging only — this is
+> **not** an infrastructure-as-code repository.
+
 End-to-end automation that turns **live CS2 (Counter-Strike 2) esports streams into ready-to-post
 vertical highlight Reels** — recording rounds off a live stream, scoring them for highlight value
 with demo-file analytics and multimodal LLM review, reframing them to 9:16 with blurred
