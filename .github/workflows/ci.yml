@@ -20,13 +20,13 @@ jobs:
 
       - name: Install test dependencies
         # The unit suite covers pure logic only; media/SDK deps are not required.
-        run: python -m pip install --upgrade pip ruff
+        run: python -m pip install --upgrade pip ruff pytest
 
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Unit tests
-        run: python -m unittest discover tests -v
+      - name: Unit tests (pytest)
+        run: python -m pytest
 
   dependency-audit:
     runs-on: ubuntu-latest

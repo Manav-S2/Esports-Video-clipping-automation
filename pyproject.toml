@@ -11,3 +11,8 @@ select = ["E9", "F63", "F7", "F82", "F401"]
 [tool.ruff.lint.per-file-ignores]
 # Re-exports kept for backwards compatibility live in __init__ and orchestrator modules.
 "tests/*" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
