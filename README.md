@@ -46,6 +46,7 @@ pip install -r requirements.txt
 # ffmpeg + streamlink must be on PATH
 
 # 2. Credentials (never committed — see SECURITY.md)
+copy .env.example .env                                             # env-var reference
 copy live_pipeline_config.example.json live_pipeline_config.json   # fill in keys
 copy speech_api_key.local.example.json speech_api_key.local.json
 
