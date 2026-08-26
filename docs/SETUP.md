@@ -36,8 +36,7 @@ python -m venv .venv
 pip install -r requirements-lock.txt
 ```
 
-`setup_windows_env.ps1`, `install_requirements.ps1` and `install_requirements.bat` remain as
-thin Windows wrappers for machines without profile scripts enabled.
+Both paths create `.venv/` in the repository root; no global installs are performed.
 
 ## External tools
 
