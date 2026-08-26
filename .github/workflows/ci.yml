@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install test dependencies
         # The unit suite covers pure logic only; media/SDK deps are not required.
@@ -30,6 +31,22 @@ jobs:
 
       - name: Unit tests (pytest)
         run: python -m pytest
+
+  install-from-lockfile:
+    # Proves a fresh clone installs reproducibly from the committed uv.lock.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync locked environment
+        run: uv sync --frozen
+
+      - name: Run test suite against the locked environment
+        run: uv run python -m pytest
 
   dependency-audit:
     runs-on: ubuntu-latest
