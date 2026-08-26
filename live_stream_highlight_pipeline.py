@@ -54,6 +54,9 @@ from llm_client import (
     _make_ssl_context,
     _urllib_retry_delay_after_network_error,
 )
+from pipeline.media_probe import clip_duration_for_analysis as _clip_duration_for_analysis
+from pipeline.media_probe import ffprobe_duration_sec as _ffprobe_duration_sec
+from pipeline.media_probe import run_ffmpeg as _run_ffmpeg
 from speech_google_captions import transcribe_and_burn, transcribe_google_long_wav
 from video_editor import apply_portrait_blur
 
@@ -205,91 +208,6 @@ def _resolve_rules_docx_path(rules_raw: str, pipeline_config_path: Path) -> Path
 
 def _now_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-
-def _run_ffmpeg(cmd: list[str]) -> None:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "ffmpeg failed\n"
-            f"cmd: {' '.join(cmd)}\n"
-            f"stdout:\n{proc.stdout}\n"
-            f"stderr:\n{proc.stderr}"
-        )
-
-
-def _resolve_ffprobe_bin(ffmpeg_bin: str | None) -> str | None:
-    """Locate ``ffprobe`` on PATH or next to ``ffmpeg`` (Windows-friendly)."""
-    w = shutil.which("ffprobe")
-    if w:
-        return w
-    if ffmpeg_bin:
-        parent = Path(ffmpeg_bin).resolve().parent
-        for name in ("ffprobe.exe", "ffprobe"):
-            cand = parent / name
-            if cand.is_file():
-                return str(cand)
-    return None
-
-
-def _ffprobe_duration_sec(media_path: Path, ffmpeg_bin: str | None) -> float | None:
-    """Return container duration in seconds, or None if unknown."""
-    exe = _resolve_ffprobe_bin(ffmpeg_bin)
-    if not exe:
-        return None
-    cmd = [
-        exe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(media_path),
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        if proc.returncode != 0:
-            return None
-        line = (proc.stdout or "").strip().splitlines()
-        if not line:
-            return None
-        val = float(line[0])
-        if val <= 0 or val != val:  # NaN check
-            return None
-        return val
-    except (ValueError, OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def _ffmpeg_demuxer_duration_sec(media_path: Path, ffmpeg_bin: str | None) -> float | None:
-    """Parse ``Duration:`` from ``ffmpeg -i`` stderr (header read only; no full decode)."""
-    if not ffmpeg_bin:
-        return None
-    cmd = [ffmpeg_bin, "-hide_banner", "-nostdin", "-i", str(media_path)]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    blob = (proc.stderr or "") + (proc.stdout or "")
-    m = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2})\.(\d+)", blob)
-    if not m:
-        return None
-    h, mn, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    frac = m.group(4)
-    try:
-        sub = int(frac) / (10 ** len(frac))
-    except ValueError:
-        return None
-    val = h * 3600 + mn * 60 + s + sub
-    return val if val > 0 else None
-
-
-def _clip_duration_for_analysis(media_path: Path, ffmpeg_bin: str | None) -> float | None:
-    d = _ffprobe_duration_sec(media_path, ffmpeg_bin)
-    if d is not None:
-        return d
-    return _ffmpeg_demuxer_duration_sec(media_path, ffmpeg_bin)
 
 
 def _highlight_analysis_equipart_times(duration_sec: float, divisions: int) -> list[float]:
