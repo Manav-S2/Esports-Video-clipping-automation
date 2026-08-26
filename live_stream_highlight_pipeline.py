@@ -57,6 +57,12 @@ from llm_client import (
 from pipeline.media_probe import clip_duration_for_analysis as _clip_duration_for_analysis
 from pipeline.media_probe import ffprobe_duration_sec as _ffprobe_duration_sec
 from pipeline.media_probe import run_ffmpeg as _run_ffmpeg
+from pipeline.process_priority import deprioritize_background_thread as _deprioritize_background_thread
+from pipeline.process_priority import os_resume_pid as _os_resume_pid
+from pipeline.process_priority import os_suspend_pid as _os_suspend_pid
+from pipeline.process_priority import (
+    subprocess_creationflags_low_priority as _subprocess_creationflags_low_priority,
+)
 from speech_google_captions import transcribe_and_burn, transcribe_google_long_wav
 from video_editor import apply_portrait_blur
 
@@ -267,125 +273,6 @@ def _numpy_enhance_rgb_float(
     blur = base.filter(ImageFilter.GaussianBlur(radius=radius))
     arr_blur = np.asarray(blur, dtype=np.float32)
     return np.clip(arr + amount * (arr - arr_blur), 0.0, 255.0)
-
-
-def _deprioritize_background_thread() -> None:
-    """Lower calling thread CPU priority so screenshot/ffmpeg/HUD paths stay responsive (Windows)."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        THREAD_PRIORITY_BELOW_NORMAL = -1
-        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
-    except Exception:
-        pass
-
-
-def _subprocess_creationflags_low_priority() -> int:
-    """Windows: start child processes (ffmpeg / CAPTIONS burn) below normal CPU priority.
-
-    Keeps the main HUD capture thread and interactive loop more responsive under heavy encode load.
-    On non-Windows, returns 0 (no extra flags).
-    """
-    if os.name != "nt":
-        return 0
-    try:
-        import subprocess as sp
-
-        return int(sp.CREATE_BELOW_NORMAL_PRIORITY_CLASS)
-    except (AttributeError, ValueError, TypeError):
-        return 0
-
-
-def _os_suspend_pid(pid: int, *, tag: str = "") -> bool:
-    """Suspend every thread in ``pid`` (Windows ``NtSuspendProcess``; POSIX ``SIGSTOP``). Best-effort."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            ntdll = ctypes.windll.ntdll
-            # PROCESS_SUSPEND_RESUME alone often fails OpenProcess on child ffmpeg; add query rights.
-            PROCESS_SUSPEND_RESUME = 0x0800
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            access = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION
-            h = kernel32.OpenProcess(access, False, ctypes.c_uint(pid))
-            if not h:
-                err = int(kernel32.GetLastError())
-                suffix = f" {tag}" if tag else ""
-                print(
-                    f"[live] WARN: OpenProcess(suspend) failed pid={pid} winerr={err}{suffix}",
-                    flush=True,
-                )
-                return False
-            try:
-                status = int(ntdll.NtSuspendProcess(h))
-                if status != 0:
-                    suffix = f" {tag}" if tag else ""
-                    print(
-                        f"[live] WARN: NtSuspendProcess failed pid={pid} status={status:#x}{suffix}",
-                        flush=True,
-                    )
-                return status == 0
-            finally:
-                kernel32.CloseHandle(h)
-        except Exception as exc:
-            suffix = f" {tag}" if tag else ""
-            print(f"[live] WARN: suspend pid={pid} raised {exc!r}{suffix}", flush=True)
-            return False
-    try:
-        os.kill(pid, signal.SIGSTOP)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-
-
-def _os_resume_pid(pid: int, *, tag: str = "") -> bool:
-    """Resume ``pid`` after :func:`_os_suspend_pid` (Windows ``NtResumeProcess``; POSIX ``SIGCONT``)."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            ntdll = ctypes.windll.ntdll
-            PROCESS_SUSPEND_RESUME = 0x0800
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            access = PROCESS_SUSPEND_RESUME | PROCESS_QUERY_LIMITED_INFORMATION
-            h = kernel32.OpenProcess(access, False, ctypes.c_uint(pid))
-            if not h:
-                err = int(kernel32.GetLastError())
-                suffix = f" {tag}" if tag else ""
-                print(
-                    f"[live] WARN: OpenProcess(resume) failed pid={pid} winerr={err}{suffix}",
-                    flush=True,
-                )
-                return False
-            try:
-                status = int(ntdll.NtResumeProcess(h))
-                if status != 0:
-                    suffix = f" {tag}" if tag else ""
-                    print(
-                        f"[live] WARN: NtResumeProcess failed pid={pid} status={status:#x}{suffix}",
-                        flush=True,
-                    )
-                return status == 0
-            finally:
-                kernel32.CloseHandle(h)
-        except Exception as exc:
-            suffix = f" {tag}" if tag else ""
-            print(f"[live] WARN: resume pid={pid} raised {exc!r}{suffix}", flush=True)
-            return False
-    try:
-        os.kill(pid, signal.SIGCONT)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
 
 
 def _vertex_generate_content(
