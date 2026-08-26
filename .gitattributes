@@ -1,3 +1,17 @@
-__pycache__ _pip_install_log.txt 0 8k frames per second plus numpy panda ask_gemini_clip5_reason.py blast-open-rotterdam-2026-parivision-vs-falcons-bo3-jB8BGzhBMGFhbYcN6o5bu2 capture_screenshots.py clip5_full_video_gemini.py clip5_full_video_round_inspection.json clip5_gemini_observation.py clip5_gemini_reason_raw.txt clip5_round_inspection.json Cropped kill feed CS2_Highlights.docx detect_cs2_highlight.py every_second_2026-03-26_22-41-03 extract_killfeed_snapshots.ps1 Frames per second highlight_result_blast_bo3.json highlight_result_blast_bo3_rounds.json highlight_result_blast_bo3_rounds_capped.json highlight_result_blast_bo3_rounds_capped_v2.json highlight_result_blast_bo3_rounds_guarded.json highlight_result_demo_plus_vertex.json highlight_result_demo_plus_vertex_25flash.json highlight_result_demo_plus_vertex_vertexai.json highlight_result_demo_plus_vertex_vertexkey.json highlight_result_demo_plus_vertex_vertexkey_modeltest.json inspect_clip5_round.py killfeed_extracted_2025-11-08_13-19-57.txt killfeed_frames_2025-11-08_13-19-57 killfeed_frames_direct_2025-11-08_13-19-57 killfeed_ocr_raw.txt killfeed_snapshots_2026-03-26_22-38-04 killfeed_snapshots_2026-03-26_22-38-34 live_pipeline_config.example.json live_pipeline_config.json live_pipeline_output live_stream_highlight_pipeline.py ocr_max_optimize.ps1 ocr8k_2026-03-27_12-52-53 optimize_frames_numpy_pandas.py Optimized video 8k 1sec frames Original Clips README.md rebuild_every_second_8k.ps1 requirements.txt riverside_automation.py riverside_vertical_caption_edit.ps1 stream_recorder.py streamlink_portable streamlink-8.3.0-1-py314-x86_64.zip Teams unified_pipeline.py video_editing_handoff_summary.docx video_editing_handoff_summary.rtf video_editor.py text=auto
-_pip_install_log.txt clip5_gemini_reason_raw.txt killfeed_extracted_2025-11-08_13-19-57.txt killfeed_ocr_raw.txt requirements.txt text eol=crlf
-extract_killfeed_snapshots.ps1 ocr_max_optimize.ps1 rebuild_every_second_8k.ps1 riverside_vertical_caption_edit.ps1 text eol=crlf
+* text=auto
+
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.toml text eol=lf
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+
+*.jpg  binary
+*.png  binary
+*.mp4  binary
+*.mkv  binary
+*.docx binary
+*.rtf  binary
