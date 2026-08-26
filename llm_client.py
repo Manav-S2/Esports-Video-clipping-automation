@@ -132,8 +132,8 @@ def _json_post(url: str, api_key: str, payload: dict[str, Any], timeout_sec: int
         with urllib.request.urlopen(req, timeout=timeout_sec, context=ssl_ctx) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {body[:1000]}") from exc
+        err_text = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {err_text[:1000]}") from exc
     return json.loads(raw)
 
 

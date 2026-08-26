@@ -192,7 +192,7 @@ def main() -> int:
     overlay_img: Path | None = None
     if not args.no_overlay:
         if args.overlay_image is not None:
-            overlay_img = args.overlay_image.resolve()
+            overlay_img = Path(args.overlay_image).resolve()
             if not overlay_img.is_file():
                 print(f"[karaoke] overlay image not found: {overlay_img}", file=sys.stderr)
                 return 2

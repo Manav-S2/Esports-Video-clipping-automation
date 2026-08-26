@@ -347,7 +347,7 @@ def transcribe_google_long_wav(
         )
 
     if (api_key or "").strip():
-        key = api_key.strip()
+        key = (api_key or "").strip()
         duration_sec = _wav_duration_seconds(wav_bytes)
         if duration_sec <= 58.0:
             response = _speech_rest_sync_recognize(wav_bytes, key, language_code)
@@ -386,12 +386,12 @@ def transcribe_google_long_wav(
     audio = speech.RecognitionAudio(content=wav_bytes)
 
     op = client.long_running_recognize(config=config, audio=audio)
-    response = op.result(timeout=timeout_sec)
+    lro_response = op.result(timeout=timeout_sec)
 
     words_out: list[dict[str, Any]] = []
     transcript_parts: list[str] = []
 
-    for result in response.results:
+    for result in lro_response.results:
         if not result.alternatives:
             continue
         alt = result.alternatives[0]
