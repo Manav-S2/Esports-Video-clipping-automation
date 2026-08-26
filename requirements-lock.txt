@@ -165,7 +165,7 @@ pydantic==2.13.4
     #   google-genai
     #   google-generativeai
     #   instagrapi
-pydantic-core==2.46.4
+pydantic-core==2.48.0
     # via pydantic
 pyparsing==3.3.2
     # via httplib2
