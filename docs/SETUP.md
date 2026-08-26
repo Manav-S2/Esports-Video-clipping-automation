@@ -48,6 +48,11 @@ automatically; on Linux/macOS install them with your package manager or
 Launch the pipeline with `python run_pipeline.py` — it resolves a CA bundle for TLS and
 forwards any extra arguments to the pipeline.
 
+## Optional extras
+
+AWS Rekognition is one of several HUD text-detection backends and is not installed by
+default. Enable it with `uv sync --extra aws` (or `pip install 'boto3>=1.34.0'`).
+
 ## Credentials
 
 All secrets live in git-ignored local files or environment variables — see
