@@ -83,10 +83,11 @@ honour Gemini's structured retry delays (`_google_gemini_retry_delay`).
   folder (`round_raw/` → `round_edited/` → `round_final/`, `meta/` for JSON logs/state).
   Stages can be re-run independently and inspected by hand.
 * **Stdlib-first HTTP** — Gemini/Vertex/Speech REST calls use `urllib` with explicit SSL
-  contexts rather than heavy SDKs in the hot path, keeping the Docker image and the
-  portable Windows setup small; official SDKs are used only where required (LRO speech).
-* **Windows-native + Docker parity** — the same pipeline runs from PowerShell scripts on a
-  gaming PC (with portable streamlink fallback) or inside the provided Docker image on a VM.
+  contexts rather than heavy SDKs in the hot path, keeping the dependency footprint
+  small; official SDKs are used only where required (LRO speech).
+* **Standalone, no containers** — the pipeline runs directly from a virtual environment
+  on Windows (with portable streamlink fallback), Linux, or macOS. External media tools
+  (ffmpeg, streamlink) are resolved from PATH rather than baked into an image.
 * **Evaluation harnesses kept in-repo** — `clip5_*` and `ask_*` scripts document how the
   prompts and model choices were validated against a known round, which is why the main
   prompts look the way they do.

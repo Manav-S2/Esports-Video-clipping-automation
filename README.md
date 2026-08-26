@@ -1,8 +1,8 @@
 # Esports Video Clipping Automation
 
 > **Project type:** Python application pipeline (media automation / applied ML).
-> The Dockerfile and docker-compose here are application packaging only — this is
-> **not** an infrastructure-as-code repository.
+> Standalone — no containers, orchestration, or infrastructure tooling involved;
+> it runs directly from a virtual environment on Windows, Linux, or macOS.
 
 End-to-end automation that turns **live CS2 (Counter-Strike 2) esports streams into ready-to-post
 vertical highlight Reels** — recording rounds off a live stream, scoring them for highlight value
@@ -36,14 +36,14 @@ live stream ──▶ round detection ──▶ per-round recording ──▶ hi
 | `ask_gemini_clip5_reason.py`, `clip5_*.py`, `inspect_clip5_round.py`, `ask_nvidia_clip_highlight.py` | Model-evaluation harnesses used to tune the highlight prompts (Gemini / NVIDIA NIM) |
 | `ocr_max_optimize.ps1`, `extract_killfeed_snapshots.ps1`, `rebuild_every_second_8k.ps1`, `optimize_frames_numpy_pandas.py` | OCR-grade video enhancement + killfeed ROI extraction toolchain (earlier OCR-based detection approach) |
 | `speech_google_captions.py` + `CAPTIONS/` | Caption styling assets and outputs |
-| `Dockerfile`, `docker-compose.yml`, `.dockerignore` | Container packaging for VM deployment |
+| `scripts/bootstrap.ps1`, `scripts/bootstrap.sh` | One-command environment setup (locked install + test run + tool check) |
 | `tests/` | Unit tests for the pure scoring/parsing/caption logic (`python -m unittest discover tests`) |
 | `docs/` | [Architecture](docs/ARCHITECTURE.md) · [Setup](docs/SETUP.md) · [Tool reference](docs/TOOLS.md) |
 
 ## Quick start
 
 ```powershell
-# 1. Environment (Windows; see docs/SETUP.md for Docker and details)
+# 1. Environment — or just run: .\scripts\bootstrap.ps1  (Linux/macOS: ./scripts/bootstrap.sh)
 python -m venv .venv
 .\.venv\Scripts\activate
 uv sync                                # reproducible install from committed uv.lock
@@ -95,7 +95,7 @@ wrapping. Network, ffmpeg, and model calls are intentionally out of unit-test sc
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — pipeline stages, data flow, failure handling
-- [docs/SETUP.md](docs/SETUP.md) — Windows / Docker setup, credentials, configuration reference
+- [docs/SETUP.md](docs/SETUP.md) — environment setup, credentials, configuration reference
 - [docs/TOOLS.md](docs/TOOLS.md) — detailed CLI reference for every tool in the repo
 - [SECURITY.md](SECURITY.md) — secret handling policy
 - [CHANGELOG.md](CHANGELOG.md) — development history

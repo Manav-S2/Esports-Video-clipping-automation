@@ -15,13 +15,13 @@ the codebase.
 * **LLM responses are hostile input**: never `json.loads` a raw model reply — route it
   through `_extract_json` / `_extract_json_block` so fences, bare keys, trailing commas,
   and truncation are handled.
-* **Windows-first, Docker-parity**: changes must work from PowerShell on Windows and
-  inside the Docker image (no hardcoded drive letters outside local config).
+* **Cross-platform**: changes must work from PowerShell on Windows and from a shell on
+  Linux/macOS (no hardcoded drive letters outside local config).
 
 ## Tests
 
 ```powershell
-python -m unittest discover tests -v
+python -m pytest            # or: python -m unittest discover tests -v
 ```
 
 Unit tests cover pure logic only (scoring, parsing, formatting). Anything that needs
