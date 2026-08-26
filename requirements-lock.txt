@@ -132,7 +132,7 @@ polars==1.44.0
     # via demoparser2
 polars-runtime-32==1.44.0
     # via polars
-proto-plus==1.28.2
+proto-plus==1.28.3
     # via
     #   google-ai-generativelanguage
     #   google-api-core
