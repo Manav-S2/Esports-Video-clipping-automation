@@ -166,6 +166,144 @@ def run_ocr_optimize(
     return out
 
 
+def escape_subtitles_path(path: Path) -> str:
+    """Escape a path for ffmpeg's ``subtitles=`` filter argument.
+
+    The filter parser treats ``\\`` and ``:`` specially, so Windows paths such as
+    ``C:\\clips\\a.srt`` must become ``C\\:/clips/a.srt``.
+    """
+    text = str(Path(path).resolve()).replace("\\", "/")
+    return text.replace(":", "\\:")
+
+
+def build_vertical_layout_filter(
+    canvas_width: int = 1080,
+    canvas_height: int = 1920,
+    *,
+    blur_strength: int = 26,
+    background_darken: float = 0.12,
+) -> str:
+    """Blurred-background vertical layout: darkened blurred fill + centered source."""
+    if not 720 <= canvas_width <= 2160:
+        raise ValueError(f"canvas_width must be 720..2160, got {canvas_width}")
+    if not 1280 <= canvas_height <= 3840:
+        raise ValueError(f"canvas_height must be 1280..3840, got {canvas_height}")
+    if not 4 <= blur_strength <= 80:
+        raise ValueError(f"blur_strength must be 4..80, got {blur_strength}")
+    if not 0.0 <= background_darken <= 0.8:
+        raise ValueError(f"background_darken must be 0.0..0.8, got {background_darken}")
+
+    return (
+        f"[0:v]split=2[bgsrc][fgsrc];"
+        f"[bgsrc]scale={canvas_width}:{canvas_height},"
+        f"boxblur={blur_strength}:{blur_strength},eq=brightness=-{background_darken}[bg];"
+        f"[fgsrc]scale={canvas_width}:-2[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2[vbase]"
+    )
+
+
+def build_vertical_caption_command(
+    input_video: Path,
+    output_video: Path,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    captions_file: Path | None = None,
+    canvas_width: int = 1080,
+    canvas_height: int = 1920,
+    blur_strength: int = 26,
+    background_darken: float = 0.12,
+    caption_font_size: int = 64,
+    caption_font: str = "Montserrat ExtraBold",
+) -> list[str]:
+    """Build the ffmpeg argv for a vertical edit with optional burned-in captions."""
+    if not 24 <= caption_font_size <= 120:
+        raise ValueError(f"caption_font_size must be 24..120, got {caption_font_size}")
+
+    layout = build_vertical_layout_filter(
+        canvas_width,
+        canvas_height,
+        blur_strength=blur_strength,
+        background_darken=background_darken,
+    )
+
+    if captions_file is not None:
+        style = (
+            f"FontName={caption_font},FontSize={caption_font_size},Alignment=8,MarginV=120,"
+            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
+            "Bold=1,BorderStyle=1,Outline=3,Shadow=0"
+        )
+        subtitle_filter = (
+            f"[vbase]subtitles='{escape_subtitles_path(captions_file)}':force_style='{style}'[vout]"
+        )
+        filter_complex = f"{layout};{subtitle_filter}"
+    else:
+        filter_complex = f"{layout};[vbase]null[vout]"
+
+    return [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(input_video),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[vout]",
+        "-map",
+        "0:a?",
+        "-c:a",
+        "copy",
+        "-c:v",
+        "libx264",
+        "-crf",
+        "14",
+        "-preset",
+        "slow",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_video),
+    ]
+
+
+def run_vertical_caption_edit(
+    input_video: Path,
+    output_video: Path | None = None,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    captions_file: Path | None = None,
+    **kwargs,
+) -> Path:
+    """Run the vertical (9:16) edit; returns the output path."""
+    input_video = Path(input_video)
+    if not input_video.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_video}")
+    if captions_file is not None:
+        captions_file = Path(captions_file)
+        if not captions_file.is_file():
+            raise FileNotFoundError(f"Captions file not found: {captions_file}")
+
+    ffmpeg = resolve_ffmpeg(ffmpeg_bin)
+    out = Path(output_video) if output_video else input_video.with_name(
+        f"{input_video.stem}.vertical.mp4"
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = build_vertical_caption_command(
+        input_video, out, ffmpeg_bin=ffmpeg, captions_file=captions_file, **kwargs
+    )
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg vertical edit failed (exit {proc.returncode})\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"stderr:\n{(proc.stderr or '')[-8000:]}"
+        )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ffmpeg video utilities for OCR-grade enhancement.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -181,6 +319,18 @@ def _build_parser() -> argparse.ArgumentParser:
     ocr.add_argument("--binarize", action="store_true", help="Hard black/white text mode.")
     ocr.add_argument("--threshold", type=int, default=150, help="Threshold used with --binarize.")
     ocr.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg executable name or path.")
+
+    vert = sub.add_parser("vertical-edit", help="Reframe to 9:16 with blurred fill and optional captions.")
+    vert.add_argument("--input", required=True, type=Path, help="Source video path.")
+    vert.add_argument("--output", type=Path, help="Destination path (default: <input>.vertical.mp4).")
+    vert.add_argument("--captions", type=Path, help="Subtitle file (.srt/.ass) to burn in.")
+    vert.add_argument("--canvas-width", type=int, default=1080, help="Output width.")
+    vert.add_argument("--canvas-height", type=int, default=1920, help="Output height.")
+    vert.add_argument("--blur-strength", type=int, default=26, help="Background boxblur radius.")
+    vert.add_argument("--background-darken", type=float, default=0.12, help="Background brightness reduction.")
+    vert.add_argument("--caption-font-size", type=int, default=64, help="Burned-in caption size.")
+    vert.add_argument("--caption-font", default="Montserrat ExtraBold", help="Burned-in caption font name.")
+    vert.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg executable name or path.")
     return parser
 
 
@@ -200,6 +350,20 @@ def main(argv: list[str] | None = None) -> int:
             threshold=args.threshold,
         )
         print(f"OCR-optimized video written to: {out}")
+    elif args.command == "vertical-edit":
+        out = run_vertical_caption_edit(
+            args.input,
+            args.output,
+            ffmpeg_bin=args.ffmpeg_bin,
+            captions_file=args.captions,
+            canvas_width=args.canvas_width,
+            canvas_height=args.canvas_height,
+            blur_strength=args.blur_strength,
+            background_darken=args.background_darken,
+            caption_font_size=args.caption_font_size,
+            caption_font=args.caption_font,
+        )
+        print(f"Vertical edit written to: {out}")
     return 0
 
 
