@@ -4,8 +4,8 @@
 
 * Python 3.12+ (3.14 works; `py -3.14` launcher paths appear in some examples)
 * `ffmpeg` on PATH (recording, editing, caption burn-in)
-* `streamlink` on PATH for Twitch/YouTube page URLs (a portable Windows build is supported —
-  see `run_live_pipeline.ps1`)
+* `streamlink` on PATH for Twitch/YouTube page URLs (a portable Windows build under
+  `streamlink_portable/` is detected automatically)
 * Windows 10/11, Linux, or macOS — the pipeline is standalone (no containers required)
 
 ## One-command setup (recommended)
@@ -42,8 +42,11 @@ Both paths create `.venv/` in the repository root; no global installs are perfor
 
 `ffmpeg` and `streamlink` are invoked as subprocesses and must be on PATH — they are not
 vendored. On Windows a portable streamlink build under `streamlink_portable/` is detected
-automatically (see `run_live_pipeline.ps1`); on Linux/macOS install them with your package
-manager or `pip install streamlink`.
+automatically; on Linux/macOS install them with your package manager or
+`pip install streamlink`.
+
+Launch the pipeline with `python run_pipeline.py` — it resolves a CA bundle for TLS and
+forwards any extra arguments to the pipeline.
 
 ## Credentials
 
