@@ -34,7 +34,7 @@ live stream ──▶ round detection ──▶ per-round recording ──▶ hi
 | `stream_recorder.py` | Standalone stream round-recorder (screenshot → Gemini round read → per-round capture) |
 | `unified_pipeline.py` | Minimal single-file pipeline variant (record → classify → portrait edit) |
 | `ask_gemini_clip5_reason.py`, `clip5_*.py`, `inspect_clip5_round.py`, `ask_nvidia_clip_highlight.py` | Model-evaluation harnesses used to tune the highlight prompts (Gemini / NVIDIA NIM) |
-| `ocr_max_optimize.ps1`, `extract_killfeed_snapshots.ps1`, `rebuild_every_second_8k.ps1`, `optimize_frames_numpy_pandas.py` | OCR-grade video enhancement + killfeed ROI extraction toolchain (earlier OCR-based detection approach) |
+| `media_tools.py`, `extract_killfeed_snapshots.ps1`, `rebuild_every_second_8k.ps1`, `optimize_frames_numpy_pandas.py` | OCR-grade video enhancement + killfeed ROI extraction toolchain (earlier OCR-based detection approach) |
 | `speech_google_captions.py` + `CAPTIONS/` | Caption styling assets and outputs |
 | `scripts/bootstrap.ps1`, `scripts/bootstrap.sh` | One-command environment setup (locked install + test run + tool check) |
 | `tests/` | Unit tests for the pure scoring/parsing/caption logic (`python -m unittest discover tests`) |

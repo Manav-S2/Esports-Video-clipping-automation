@@ -16,27 +16,27 @@ The script applies an OCR-focused filter chain:
 
 ## Run
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4"
+```bash
+python media_tools.py ocr-optimize --input "D:/path/to/your/video.mp4"
 ```
 
 Optional parameters:
 
-```powershell
--OutputVideo "D:\path\to\output.ocr-max.mp4"   # custom output path
--ScaleFactor 2                                     # 1 to 4
--Crf 18                                            # compressed mode quality (lower is higher quality)
--Preset slow                                       # ultrafast..veryslow (speed vs compression)
--Codec h264                                        # h264 (faster) or h265 (smaller, slower)
--Lossless                                          # switch to FFV1 MKV output (very large files)
--Binarize                                          # hard black/white text mode
--Threshold 150                                     # threshold used with -Binarize
+```text
+--output PATH        # custom output path (default: <input>.ocr-max.mp4)
+--scale-factor 2     # 1 to 4
+--crf 18             # compressed mode quality (lower is higher quality)
+--preset slow        # ultrafast..veryslow (speed vs compression)
+--codec h264         # h264 (faster) or h265 (smaller, slower)
+--lossless           # switch to FFV1 MKV output (very large files)
+--binarize           # hard black/white text mode
+--threshold 150      # threshold used with --binarize
 ```
 
 ## Highest clarity mode (compressed, recommended default)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Crf 18 -Preset slow -Binarize -Threshold 155
+```bash
+python media_tools.py ocr-optimize --input "D:/path/to/your/video.mp4" --scale-factor 2 --crf 18 --preset slow --binarize --threshold 155
 ```
 
 If text strokes break, reduce threshold (for example `-Threshold 135`).
@@ -44,16 +44,16 @@ If background bleed remains, raise threshold (for example `-Threshold 170`).
 
 ## True lossless archival mode (largest files)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Lossless -Binarize -Threshold 155
+```bash
+python media_tools.py ocr-optimize --input "D:/path/to/your/video.mp4" --scale-factor 2 --lossless --binarize --threshold 155
 ```
 
 Use this mode only when you need mathematically lossless output for repeated processing.
 
 ## Smaller compressed files with H.265
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\ocr_max_optimize.ps1 -InputVideo "D:\path\to\your\video.mp4" -ScaleFactor 2 -Codec h265 -Crf 20 -Preset slow -Binarize -Threshold 155
+```bash
+python media_tools.py ocr-optimize --input "D:/path/to/your/video.mp4" --scale-factor 2 --codec h265 --crf 20 --preset slow --binarize --threshold 155
 ```
 
 H.265 is usually slower to encode than H.264, but often produces smaller files at similar visual quality.
