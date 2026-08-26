@@ -43,3 +43,10 @@ every_second_*/
 Cropped kill feed/
 Frames per second/
 Optimized video 8k 1sec frames/
+
+# Frame/screenshot working sets from the OCR experiments. These were removed from
+# git history to bring the repository under hosting size limits (they reached
+# ~2 GB); keep them local so they are never re-committed.
+0/
+screens/
+!0/frame_metrics.csv
