@@ -38,6 +38,8 @@ from audio_analysis import (
     _mono16_wav_rms_timeline,
     _summarize_rms_spikes,
 )
+from config_schema import load_config as config_load_config
+from config_schema import validate_config
 from detect_cs2_highlight import (
     _assign_round_numbers,
     _load_kill_events,
@@ -4889,9 +4891,11 @@ def _merge_aws_credentials_local_file(config_path: Path, cfg: dict[str, Any]) ->
 
 
 def _load_config(path: Path, *, captions_batch_mode: bool = False) -> PipelineConfig:
-    raw_cfg = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(raw_cfg, dict):
-        raise ValueError("pipeline config JSON must be an object")
+    # Validate up front so typos and out-of-range values fail immediately with a
+    # full list of problems, rather than surfacing mid-run.
+    raw_cfg = config_load_config(path)
+    for warning in validate_config(raw_cfg).warnings:
+        print(f"[live] config warning: {warning}", flush=True)
     cfg: dict[str, Any] = {**_pipeline_builtin_json_defaults(), **raw_cfg}
     _merge_aws_credentials_local_file(path, cfg)
 
