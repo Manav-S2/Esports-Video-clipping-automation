@@ -57,7 +57,7 @@ copy speech_api_key.local.example.json speech_api_key.local.json
 
 # 3. Run the live pipeline
 $env:GEMINI_API_KEY = "YOUR_KEY"
-python .\live_stream_highlight_pipeline.py --config .\live_pipeline_config.json
+python run_pipeline.py            # or: python live_stream_highlight_pipeline.py --config live_pipeline_config.json
 ```
 
 Offline highlight screening of an existing clip + demo:
