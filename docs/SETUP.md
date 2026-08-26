@@ -6,29 +6,45 @@
 * `ffmpeg` on PATH (recording, editing, caption burn-in)
 * `streamlink` on PATH for Twitch/YouTube page URLs (a portable Windows build is supported —
   see `run_live_pipeline.ps1`)
-* Windows 10/11 or Docker (Linux image provided)
+* Windows 10/11, Linux, or macOS — the pipeline is standalone (no containers required)
 
-## Windows
+## One-command setup (recommended)
 
 ```powershell
-.\setup_windows_env.ps1          # creates venv + installs requirements
-# or manually:
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+.\scripts\bootstrap.ps1          # Windows
 ```
-
-`install_requirements.ps1` / `install_requirements.bat` are thin wrappers for machines
-without profile scripts enabled.
-
-## Docker
 
 ```bash
-docker compose up --build        # see docker-compose.yml for mounts
+./scripts/bootstrap.sh            # Linux / macOS
 ```
 
-The image bundles ffmpeg and the Python deps; configs and output folders are mounted from
-the host so recordings survive container restarts.
+The bootstrap script creates an isolated virtual environment from the committed `uv.lock`
+(falling back to `requirements-lock.txt` when `uv` is absent), runs the test suite to prove
+the install works, and reports whether `ffmpeg` and `streamlink` are on PATH.
+
+## Manual setup
+
+```powershell
+uv sync                           # locked install from uv.lock
+```
+
+Or with plain venv + pip:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate         # Linux/macOS: source .venv/bin/activate
+pip install -r requirements-lock.txt
+```
+
+`setup_windows_env.ps1`, `install_requirements.ps1` and `install_requirements.bat` remain as
+thin Windows wrappers for machines without profile scripts enabled.
+
+## External tools
+
+`ffmpeg` and `streamlink` are invoked as subprocesses and must be on PATH — they are not
+vendored. On Windows a portable streamlink build under `streamlink_portable/` is detected
+automatically (see `run_live_pipeline.ps1`); on Linux/macOS install them with your package
+manager or `pip install streamlink`.
 
 ## Credentials
 

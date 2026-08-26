@@ -2,6 +2,17 @@
 
 Development history of the project (newest first). See `git log` for full detail.
 
+## 2026-08 — Standalone pipeline (Docker removed)
+- Removed `Dockerfile`, `docker-compose.yml` and `.dockerignore`; the pipeline now runs
+  directly from a virtual environment on Windows, Linux, or macOS.
+- Added `scripts/bootstrap.ps1` / `scripts/bootstrap.sh` for one-command setup
+  (locked install, test-suite verification, ffmpeg/streamlink PATH check).
+- Docs and in-source hints reworded away from container assumptions.
+
+## 2026-08 — Quality tooling
+- uv lockfile with a CI job proving fresh-clone install; ruff (I/UP/W/B) and mypy gates;
+  typed error hierarchy with loguru logging; test suite grown to 111 tests.
+
 ## 2026-08 — Review packaging
 - Added LICENSE, structured documentation (`docs/`), SECURITY and CONTRIBUTING notes,
   changelog, and a unit-test suite for the deterministic core logic.

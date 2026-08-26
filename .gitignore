@@ -9,7 +9,7 @@ node_modules/
 dist/
 build/
 
-# Docker image export for VMs (`docker save -o esports-video-clipping_latest.tar …`).
+# Legacy image export from the removed container packaging.
 esports-video-clipping_latest.tar
 
 # Local credentials / secrets — copy from *.example.json / env vars instead.

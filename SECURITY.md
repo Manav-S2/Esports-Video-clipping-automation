@@ -12,8 +12,8 @@ Real secrets live in git-ignored files or environment variables:
 | AWS credentials | `aws_credentials.local.json` | standard AWS env vars / profile |
 | Instagram login | `live_pipeline_config.json` | `INSTA_USER` / `INSTA_PASS` |
 
-`.gitignore` and `.dockerignore` both exclude every secret file, virtualenvs, and
-generated media, so neither git history nor the Docker build context can capture them.
+`.gitignore` excludes every secret file, virtualenv, and generated media artifact, so
+credentials never enter git history.
 
 ## Network surface
 

@@ -174,8 +174,8 @@ def _extract_docx_text(docx_path: Path) -> str:
 def _resolve_rules_docx_path(rules_raw: str, pipeline_config_path: Path) -> Path:
     """Resolve ``rules_docx`` for config + host OS.
 
-    Windows-style absolute paths (``C:\\...``) are not POSIX-absolute, so Docker/Linux used to join
-    them with ``/app`` and break. On non-Windows we map those to ``<config_dir>/<basename>`` (bind-mounted repo).
+    Windows-style absolute paths (``C:\\...``) are not POSIX-absolute, so on Linux/macOS they
+    would be joined onto the CWD and break. There we map them to ``<config_dir>/<basename>``.
     """
     s = (rules_raw or "").strip()
     if not s:
@@ -691,7 +691,6 @@ def _captions_workspace_root() -> Path:
     """Parent directory that contains ``CAPTIONS/burn_karaoke_captions.py``.
 
     Mono-repo: ``ca/CAPTIONS`` next to ``ca/Esports-Video-clipping-automation`` (this file).
-    Docker (default compose): mount that folder at ``/app/CAPTIONS`` so ``/app`` is the returned root.
 
     Override: ``CAPTIONS_BURN_SCRIPT`` = absolute path to ``burn_karaoke_captions.py``, or
     ``CAPTIONS_KARAOKE_ROOT`` = parent of the ``CAPTIONS`` directory.
@@ -712,7 +711,7 @@ def _captions_workspace_root() -> Path:
     for root in (live_dir.parent, live_dir):
         if (root / "CAPTIONS" / "burn_karaoke_captions.py").is_file():
             return root.resolve()
-    # Expected layout when using docker-compose ``../CAPTIONS:/app/CAPTIONS`` (script not mounted yet).
+    # No CAPTIONS directory found alongside the pipeline; fall back to this module's directory.
     return live_dir.resolve()
 
 
@@ -1182,7 +1181,7 @@ def _rekognition_scores_from_crop(
                 f"({code}: invalid/expired access key or session token).\n"
                 "  • Long-term IAM: check AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY.\n"
                 "  • Temporary keys: refresh AWS_SESSION_TOKEN (SSO/STS expire).\n"
-                "  • Docker Compose: unset wrong host env vars or pass fresh ones — they override "
+                "  • Shell environment: unset stale exported vars or replace them — they override "
                 "aws_credentials.local.json inside the merged config.\n"
                 f"  • Region used: {region_name}"
             ) from exc
@@ -1453,9 +1452,9 @@ class PipelineConfig:
     karaoke_vertex_roster_path: str
     # Extra ``streamlink`` CLI args before ``--stream-url`` (all page URLs).
     streamlink_extra_args: list[str]
-    # Prepended for twitch.tv URLs only (defaults help Docker/Twitch flakey segments).
+    # Prepended for twitch.tv URLs only (defaults help with flakey Twitch segments).
     streamlink_twitch_extra_args: list[str]
-    # Timeout seconds for ``streamlink --stream-url`` (Docker/WSL DNS can need >45s).
+    # Timeout seconds for ``streamlink --stream-url`` (slow/VPN DNS can need >45s).
     streamlink_resolve_timeout_sec: int
 
 
@@ -2352,7 +2351,7 @@ class LiveRoundPipeline:
 
         lower = src.lower()
         if "twitch.tv/" in lower or "youtube.com/" in lower or "youtu.be/" in lower:
-            # Prefer portable Windows builds only on native Windows. Under Linux/macOS (including Docker bind-mounts),
+            # Prefer portable Windows builds only on native Windows. Under Linux/macOS,
             # ./streamlink_portable/*.exe may exist from the host but must not run — use pip/system ``streamlink``.
             streamlink_exec: str | None = None
             if sys.platform == "win32":
@@ -2371,7 +2370,7 @@ class LiveRoundPipeline:
                 raise RuntimeError(
                     "streamlink is required for page URLs like Twitch/YouTube. "
                     "On Windows: put streamlink.exe in ./streamlink_portable/ or install streamlink on PATH. "
-                    "On Linux/Docker: pip install streamlink (already in container image) or install streamlink on PATH."
+                    "On Linux/macOS: pip install streamlink, or install it via your package manager onto PATH."
                 )
 
             twitch_low = "twitch.tv/" in lower
@@ -2393,22 +2392,21 @@ class LiveRoundPipeline:
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
-                    f"streamlink --stream-url timed out after {timeout_sec}s (network, Twitch, or Docker/WSL DNS)."
+                    f"streamlink --stream-url timed out after {timeout_sec}s (network, Twitch, or slow DNS)."
                 ) from exc
             if proc.returncode != 0:
                 hint = ""
                 err_blob = f"{proc.stderr or ''}\n{proc.stdout or ''}".lower()
                 if not (proc.stderr or "").strip() and not (proc.stdout or "").strip():
                     hint = (
-                        "\n[live] Hint: empty streamlink output often happens under Docker Desktop + WSL2 "
-                        "(vsock/socket errors). Try: restart Docker Desktop, update it, disable VPN briefly, "
-                        "or run the pipeline on Windows host (not container). "
-                        "Smoke test: docker compose run --rm streamlink-debug --stream-url \"TWITCH_URL\" best\n"
+                        "\n[live] Hint: empty streamlink output usually means a blocked or proxied network. "
+                        "Try: disable VPN briefly, check DNS, and smoke-test directly with "
+                        "streamlink --stream-url \"TWITCH_URL\" best\n"
                     )
                 elif "vsock" in err_blob or "utilbindvsock" in err_blob.replace(" ", ""):
                     hint = (
-                        "\n[live] Hint: WSL/Docker networking glitch — restart Docker Desktop or run streamlink on "
-                        "the Windows host.\n"
+                        "\n[live] Hint: WSL networking glitch — run streamlink on the Windows host instead of "
+                        "inside WSL.\n"
                     )
                 raise RuntimeError(
                     "Failed to resolve stream URL via streamlink.\n"
@@ -4688,7 +4686,7 @@ class LiveRoundPipeline:
                 ok = sp.is_file()
                 print(
                     f"[live] karaoke CAPTIONS router: {sp} (exists={ok}). "
-                    "If false in Docker, mount CAPTIONS or set CAPTIONS_BURN_SCRIPT / CAPTIONS_KARAOKE_ROOT.",
+                    "If false, place CAPTIONS next to this repo or set CAPTIONS_BURN_SCRIPT / CAPTIONS_KARAOKE_ROOT.",
                     flush=True,
                 )
         except Exception:
