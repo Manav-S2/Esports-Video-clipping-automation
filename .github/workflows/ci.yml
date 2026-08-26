@@ -58,9 +58,7 @@ jobs:
           python-version: "3.12"
 
       - name: pip-audit against requirements
-        # Non-blocking: reports known vulnerabilities in pinned deps without
-        # failing the build on advisories in transitive media libraries.
-        continue-on-error: true
+        # Blocking: a known vulnerability in a pinned dependency fails the build.
         run: |
           python -m pip install --upgrade pip pip-audit
           pip-audit -r requirements.txt
