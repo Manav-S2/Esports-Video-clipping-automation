@@ -2,6 +2,12 @@
 
 Development history of the project (newest first). See `git log` for full detail.
 
+## 2026-08 — Optional container sandbox
+- Reinstated `Dockerfile`/`docker-compose.yml` as *optional* application packaging:
+  the image bundles ffmpeg and streamlink and defaults to running the test suite,
+  so the project can be exercised in isolation without host tooling.
+- CI gained a `docker-build` job that builds the image and runs the suite inside it.
+
 ## 2026-08 — Cross-platform tooling
 - Ported all PowerShell utilities to tested Python CLIs (`media_tools.py`,
   `run_pipeline.py`); removed the obsolete Windows installer scripts.

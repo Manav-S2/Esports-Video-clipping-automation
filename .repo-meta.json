@@ -3,5 +3,5 @@
   "primary_class": "media-automation-pipeline",
   "domains": ["esports", "video-processing", "applied-ml"],
   "language": "python",
-  "notes": "Standalone Python application pipeline. No containers, orchestration, or infrastructure-as-code tooling of any kind: it runs from a virtual environment and shells out to ffmpeg/streamlink."
+  "notes": "Standalone Python CLI/application. The optional Dockerfile and docker-compose.yml are application packaging for a reproducible sandbox, not infrastructure-as-code: no Terraform, Kubernetes, Helm, Pulumi, or provisioned cloud resources exist in this repository."
 }

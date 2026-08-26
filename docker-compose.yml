@@ -1,0 +1,40 @@
+# Application packaging for the CS2 highlight tool (not infrastructure-as-code:
+# there are no backing services, databases, or provisioned resources here).
+#
+#   docker compose run --rm tests      # one command: build + run the test suite
+#   docker compose run --rm pipeline   # live run against your config
+#   docker compose run --rm shell      # interactive shell in the image
+
+services:
+  # Default entry point: proves the image builds and the suite passes with no
+  # host dependencies installed.
+  tests:
+    build: .
+    image: cs2-highlight:latest
+    command: ["python", "-m", "pytest", "-q"]
+
+  # Live pipeline. Config and credentials stay on the host and are mounted in;
+  # output folders are bind-mounted so recordings survive container restarts.
+  pipeline:
+    build: .
+    image: cs2-highlight:latest
+    command: ["python", "run_pipeline.py"]
+    environment:
+      - GEMINI_API_KEY
+      - GOOGLE_SPEECH_API_KEY
+      - VERTEX_API_KEY
+      - VERTEX_PROJECT_ID
+      - VERTEX_LOCATION
+      - INSTA_USER
+      - INSTA_PASS
+    volumes:
+      - ./live_pipeline_config.json:/app/live_pipeline_config.json:ro
+      - ./CS2_Highlights.docx:/app/CS2_Highlights.docx:ro
+      - ./live_pipeline_output:/app/live_pipeline_output
+
+  shell:
+    build: .
+    image: cs2-highlight:latest
+    entrypoint: ["bash"]
+    volumes:
+      - ./live_pipeline_output:/app/live_pipeline_output

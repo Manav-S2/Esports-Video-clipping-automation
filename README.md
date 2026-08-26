@@ -1,8 +1,9 @@
 # Esports Video Clipping Automation
 
-> **Project type:** Python application pipeline (media automation / applied ML).
-> Standalone — no containers, orchestration, or infrastructure tooling involved;
-> it runs directly from a virtual environment on Windows, Linux, or macOS.
+> **Project classification:** standalone Python CLI/application (media automation
+> and applied ML). It runs from a virtual environment on Windows, Linux, or macOS;
+> the optional Dockerfile/compose file are *application packaging* for reproducible
+> sandboxes. There is no Terraform, Kubernetes, or other infrastructure-as-code here.
 
 End-to-end automation that turns **live CS2 (Counter-Strike 2) esports streams into ready-to-post
 vertical highlight Reels** — recording rounds off a live stream, scoring them for highlight value
@@ -37,6 +38,7 @@ live stream ──▶ round detection ──▶ per-round recording ──▶ hi
 | `media_tools.py`, `extract_killfeed_snapshots.ps1`, `rebuild_every_second_8k.ps1`, `optimize_frames_numpy_pandas.py` | OCR-grade video enhancement + killfeed ROI extraction toolchain (earlier OCR-based detection approach) |
 | `speech_google_captions.py` + `CAPTIONS/` | Caption styling assets and outputs |
 | `scripts/bootstrap.ps1`, `scripts/bootstrap.sh` | One-command environment setup (locked install + test run + tool check) |
+| `Dockerfile`, `docker-compose.yml` | Optional sandbox image bundling ffmpeg/streamlink for a host-free run |
 | `tests/` | Unit tests for the pure scoring/parsing/caption logic (`python -m unittest discover tests`) |
 | `docs/` | [Architecture](docs/ARCHITECTURE.md) · [Setup](docs/SETUP.md) · [Tool reference](docs/TOOLS.md) |
 

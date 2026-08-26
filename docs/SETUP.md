@@ -6,7 +6,20 @@
 * `ffmpeg` on PATH (recording, editing, caption burn-in)
 * `streamlink` on PATH for Twitch/YouTube page URLs (a portable Windows build under
   `streamlink_portable/` is detected automatically)
-* Windows 10/11, Linux, or macOS — the pipeline is standalone (no containers required)
+* Windows 10/11, Linux, or macOS — no containers required, though a Dockerfile is
+  provided for a reproducible sandbox that bundles ffmpeg and streamlink
+
+## Container setup (no host tooling)
+
+```bash
+docker compose run --rm tests      # build + run the suite; proves the image works
+docker compose run --rm pipeline   # live run, config mounted from the host
+docker compose run --rm shell      # interactive shell
+```
+
+The image installs ffmpeg and libsndfile via apt and the Python dependencies from
+`uv.lock`, so nothing needs to exist on the host. Credentials are passed through as
+environment variables and the config is mounted read-only.
 
 ## One-command setup (recommended)
 
