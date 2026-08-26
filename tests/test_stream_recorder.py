@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import stream_recorder  # noqa: E402
+from errors import StreamResolutionError, ToolNotFoundError  # noqa: E402
 from stream_recorder import StreamRoundRecorder  # noqa: E402
 
 
@@ -46,11 +47,20 @@ class ResolveStreamInputTests(unittest.TestCase):
                 self.assertEqual(rec._resolve_stream_input(), "https://real.m3u8")
             self.assertIn("--stream-url", run.call_args[0][0])
 
-    def test_twitch_url_without_streamlink_raises(self):
+    def test_twitch_url_without_streamlink_raises_typed_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = _recorder(tmp, url="https://twitch.tv/somechannel")
             with mock.patch.object(stream_recorder.shutil, "which", return_value=None):
-                with self.assertRaises(RuntimeError):
+                with self.assertRaises(ToolNotFoundError):
+                    rec._resolve_stream_input()
+
+    def test_streamlink_failure_raises_stream_resolution_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rec = _recorder(tmp, url="https://twitch.tv/somechannel")
+            err = stream_recorder.subprocess.CalledProcessError(1, ["streamlink"], stderr="boom")
+            with mock.patch.object(stream_recorder.shutil, "which", return_value="streamlink"), \
+                 mock.patch.object(stream_recorder.subprocess, "run", side_effect=err):
+                with self.assertRaises(StreamResolutionError):
                     rec._resolve_stream_input()
 
     def test_resolution_is_cached(self):
@@ -81,11 +91,12 @@ class CaptureScreenshotTests(unittest.TestCase):
             self.assertIsNotNone(out)
             self.assertTrue(out.exists())
 
-    def test_returns_none_when_ffmpeg_missing(self):
+    def test_missing_ffmpeg_raises_typed_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             rec = _recorder(tmp)
             with mock.patch.object(stream_recorder.shutil, "which", return_value=None):
-                self.assertIsNone(rec.capture_screenshot())
+                with self.assertRaises(ToolNotFoundError):
+                    rec.capture_screenshot()
 
     def test_returns_none_when_no_file_created(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,6 +7,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from loguru import logger
+
+from errors import PipelineConfigError, StreamResolutionError, ToolNotFoundError
+
 # Make sure you have these installed:
 # pip install google-generativeai streamlink PyPDF2 Pillow pandas openpyxl
 # You also need ffmpeg and streamlink installed on your system PATH.
@@ -16,7 +20,7 @@ try:
     from google import genai
     from google.genai import types as genai_types
 except ImportError:
-    print("Warning: google-generativeai not installed. Round detection will not work.")
+    logger.warning("google-generativeai not installed. Round detection will not work.")
     genai = None
     genai_types = None
 
@@ -54,20 +58,23 @@ class StreamRoundRecorder:
         if "twitch.tv/" in lower or "youtube.com/" in lower or "youtu.be/" in lower:
             streamlink_path = shutil.which("streamlink")
             if not streamlink_path:
-                raise RuntimeError(
-                    "streamlink is required for Twitch/YouTube URLs. Install it with: pip install streamlink"
-                    " and ensure it's in your system PATH."
+                raise ToolNotFoundError(
+                    "streamlink",
+                    hint="required for Twitch/YouTube URLs; install with pip install streamlink",
                 )
-            print(f"Resolving stream URL for {src}...")
-            proc = subprocess.run(
-                [streamlink_path, "--stream-url", src, "best"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
+            logger.info("Resolving stream URL for {}...", src)
+            try:
+                proc = subprocess.run(
+                    [streamlink_path, "--stream-url", src, "best"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise StreamResolutionError(f"streamlink failed for {src}: {exc.stderr}") from exc
             resolved = (proc.stdout or "").strip().splitlines()[-1].strip()
             if not resolved:
-                raise RuntimeError("streamlink returned an empty stream URL.")
+                raise StreamResolutionError(f"streamlink returned an empty stream URL for {src}.")
             self._resolved_stream_url = resolved
             return resolved
 
@@ -79,12 +86,11 @@ class StreamRoundRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         screenshot_path = self.screens_dir / f"screen_{timestamp}.jpg"
 
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise ToolNotFoundError("ffmpeg")
         try:
             stream_input = self._resolve_stream_input()
-            ffmpeg_path = shutil.which("ffmpeg")
-            if not ffmpeg_path:
-                raise RuntimeError("ffmpeg not found in system PATH.")
-
             cmd = [
                 ffmpeg_path,
                 "-hide_banner",
@@ -99,24 +105,26 @@ class StreamRoundRecorder:
                 "2",
                 str(screenshot_path),
             ]
-            print(f"Capturing screenshot: {screenshot_path.name}")
+            logger.debug("Capturing screenshot: {}", screenshot_path.name)
             subprocess.run(cmd, check=True, capture_output=True, text=True)
 
             if screenshot_path.exists():
                 return screenshot_path
-            print(f"Error: Screenshot file not created at {screenshot_path}")
+            logger.warning("Screenshot file not created at {}", screenshot_path)
             return None
+        except PipelineConfigError:
+            raise
         except subprocess.CalledProcessError as e:
-            print(f"FFmpeg screenshot failed: {e.stderr}")
+            logger.warning("FFmpeg screenshot failed: {}", e.stderr)
             return None
-        except Exception as e:
-            print(f"Error capturing screenshot: {e}")
+        except Exception:
+            logger.exception("Error capturing screenshot")
             return None
 
     def detect_round_from_screenshot(self, image_path: Path) -> int | None:
         """Uses Gemini to detect the current round number from a screenshot."""
         if not self.client:
-            print("Gemini client not initialized. Cannot detect rounds.")
+            logger.warning("Gemini client not initialized. Cannot detect rounds.")
             return None
 
         prompt = (
@@ -144,10 +152,10 @@ class StreamRoundRecorder:
                     return int(parsed["round"])
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-            print(f"Gemini returned non-numeric/unparsable response: {response_text}")
+            logger.warning("Gemini returned non-numeric/unparsable response: {}", response_text)
             return None
-        except Exception as e:
-            print(f"Gemini round detection failed: {e}")
+        except Exception:
+            logger.exception("Gemini round detection failed")
             return None
         finally:
             image_path.unlink(missing_ok=True)
@@ -155,17 +163,17 @@ class StreamRoundRecorder:
     def start_recording_round(self, round_num: int):
         """Starts screen recording the current round in 1080p."""
         if self.recording_process:
-            print("Warning: Recording already in progress. Stopping previous recording.")
+            logger.warning("Recording already in progress. Stopping previous recording.")
             self.stop_recording()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_recording_path = self.raw_clips_dir / f"round_{round_num:02d}_{timestamp}.mp4"
 
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise ToolNotFoundError("ffmpeg")
         try:
             stream_input = self._resolved_stream_url
-            ffmpeg_path = shutil.which("ffmpeg")
-            if not ffmpeg_path:
-                raise RuntimeError("ffmpeg not found in system PATH.")
 
             cmd = [
                 ffmpeg_path,
@@ -190,32 +198,32 @@ class StreamRoundRecorder:
                 str(self.current_recording_path),
             ]
 
-            print(f"Starting recording for Round {round_num}: {self.current_recording_path.name}")
+            logger.info("Starting recording for Round {}: {}", round_num, self.current_recording_path.name)
             self.recording_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             self.current_round = round_num
-        except Exception as e:
-            print(f"Error starting recording: {e}")
+        except Exception:
+            logger.exception("Error starting recording")
             self.current_recording_path = None
             self.current_round = None
 
     def stop_recording(self):
         """Stops the current recording process."""
         if self.recording_process:
-            print(f"Stopping recording for Round {self.current_round}...")
+            logger.info("Stopping recording for Round {}...", self.current_round)
             self.recording_process.communicate(input=b"q")
             self.recording_process.wait()
             self.recording_process = None
             self.current_round = None
-            print("Recording stopped.")
+            logger.info("Recording stopped.")
         self.current_recording_path = None
 
     def run_monitor(self):
         """Main loop to monitor the stream, detect rounds, and record clips."""
-        print(f"Starting live stream monitor for: {self.stream_url}")
+        logger.info("Starting live stream monitor for: {}", self.stream_url)
 
         try:
             self._resolve_stream_input()
-            print(f"Resolved stream input: {self._resolved_stream_url}")
+            logger.info("Resolved stream input: {}", self._resolved_stream_url)
 
             while True:
                 screenshot = self.capture_screenshot()
@@ -226,27 +234,31 @@ class StreamRoundRecorder:
                         if self.current_round is None:
                             self.start_recording_round(detected_round)
                         elif detected_round > self.current_round:
-                            print(f"Detected new round: {detected_round}. Previous was {self.current_round}.")
+                            logger.info("Detected new round: {}. Previous was {}.", detected_round, self.current_round)
                             self.stop_recording()
                             self.start_recording_round(detected_round)
                         else:
                             if self.current_round != detected_round:
-                                print(
-                                    f"Warning: Detected round {detected_round}, but expected {self.current_round} "
-                                    "or higher. Still recording current round."
+                                logger.warning(
+                                    "Detected round {}, but expected {} or higher. Still recording current round.",
+                                    detected_round,
+                                    self.current_round,
                                 )
                     else:
-                        print("Could not detect round number from screenshot. Continuing to monitor.")
+                        logger.debug("Could not detect round number from screenshot. Continuing to monitor.")
 
                 time.sleep(2)
 
         except KeyboardInterrupt:
-            print("\nMonitoring stopped by user (Ctrl+C).")
-        except Exception as e:
-            print(f"An error occurred in the monitoring loop: {e}")
+            logger.info("Monitoring stopped by user (Ctrl+C).")
+        except PipelineConfigError:
+            # Setup problems (missing tools, bad credentials) must fail loudly.
+            raise
+        except Exception:
+            logger.exception("An error occurred in the monitoring loop")
         finally:
             self.stop_recording()
-            print("Stream recorder gracefully shut down.")
+            logger.info("Stream recorder gracefully shut down.")
 
 
 def main():
@@ -279,7 +291,7 @@ def main():
             "Gemini API key is required for round detection. Provide with --gemini-api-key or set GEMINI_API_KEY."
         )
     elif not genai:
-        print("Warning: google-generativeai not installed. Round detection will not work.")
+        logger.warning("google-generativeai not installed. Round detection will not work.")
         gemini_api_key = ""
 
     output_path = Path(args.output_dir)
