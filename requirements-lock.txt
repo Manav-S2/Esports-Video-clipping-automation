@@ -230,7 +230,7 @@ urllib3==2.7.0
     #   streamlink
 websocket-client==1.9.0
     # via streamlink
-websockets==16.1.1
+websockets==17.0.1
     # via google-genai
 win32-setctime==1.2.0
     # via loguru
