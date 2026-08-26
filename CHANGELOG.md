@@ -2,6 +2,13 @@
 
 Development history of the project (newest first). See `git log` for full detail.
 
+## 2026-08 — Cross-platform tooling
+- Ported all PowerShell utilities to tested Python CLIs (`media_tools.py`,
+  `run_pipeline.py`); removed the obsolete Windows installer scripts.
+- `boto3` moved to an optional `aws` extra.
+- **Audit policy:** the `pip-audit` CI job is now blocking — a known vulnerability
+  in a pinned dependency fails the build rather than being reported and ignored.
+
 ## 2026-08 — Standalone pipeline (Docker removed)
 - Removed `Dockerfile`, `docker-compose.yml` and `.dockerignore`; the pipeline now runs
   directly from a virtual environment on Windows, Linux, or macOS.
