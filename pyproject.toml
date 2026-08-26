@@ -1,3 +1,32 @@
+[project]
+name = "esports-highlight-engine"
+version = "0.1.0"
+description = "Automated CS2 esports highlight pipeline: live-stream round capture, demo+LLM highlight scoring, portrait edits, karaoke captions, publishing"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+dependencies = [
+    "certifi>=2024.0.0",
+    "boto3>=1.34.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "Pillow>=10.4.0",
+    "demoparser2>=0.38.0",
+    "google-generativeai>=0.8.5",
+    "google-genai>=1.14.0",
+    "instagrapi>=2.1.3",
+    "streamlink>=8.3.0",
+    "google-cloud-speech>=2.26.0",
+    "loguru>=0.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
