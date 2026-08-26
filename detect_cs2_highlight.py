@@ -1823,13 +1823,11 @@ class LiveStreamMonitor:
             fps=30.0,
         )
 
-        # 3. Add Captions (Riverside Script)
+        # 3. Add Captions (vertical edit with burned-in captions)
         captioned_path = self.processed_dir / f"round_{round_num}_captioned.mp4"
-        ps_cmd = [
-            "powershell", "-ExecutionPolicy", "Bypass", "-File", "riverside_vertical_caption_edit.ps1",
-            "-InputVideo", str(portrait_path), "-OutputVideo", str(captioned_path)
-        ]
-        subprocess.run(ps_cmd)
+        from media_tools import run_vertical_caption_edit
+
+        run_vertical_caption_edit(portrait_path, captioned_path)
 
         # 4. Generate Title & SEO
         print(f"Generated Title: {analysis.get('title')}")
