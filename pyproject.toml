@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 license = {file = "LICENSE"}
 dependencies = [
     "certifi>=2024.0.0",
-    "boto3>=1.34.0",
     "numpy>=2.0.0",
     "pandas>=2.2.0",
     "Pillow>=10.4.0",
@@ -19,6 +18,10 @@ dependencies = [
     "google-cloud-speech>=2.26.0",
     "loguru>=0.7.0",
 ]
+
+[project.optional-dependencies]
+# AWS Rekognition is one of several HUD text-detection backends; not needed by default.
+aws = ["boto3>=1.34.0"]
 
 [dependency-groups]
 dev = [

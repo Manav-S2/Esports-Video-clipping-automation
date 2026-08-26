@@ -1,5 +1,5 @@
 certifi>=2024.0.0
-boto3>=1.34.0
+# boto3 is optional (AWS Rekognition HUD backend): pip install 'boto3>=1.34.0'
 numpy>=2.0.0
 pandas>=2.2.0
 Pillow>=10.4.0
