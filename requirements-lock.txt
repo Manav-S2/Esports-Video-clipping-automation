@@ -128,7 +128,7 @@ pillow==12.3.0
     # via
     #   -r requirements.txt
     #   instagrapi
-polars==1.44.0
+polars==1.44.1
     # via demoparser2
 polars-runtime-32==1.44.0
     # via polars
