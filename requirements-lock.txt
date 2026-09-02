@@ -99,7 +99,7 @@ idna==3.19
     #   httpx
     #   requests
     #   trio
-instagrapi==2.18.17
+instagrapi==2.18.18
     # via -r requirements.txt
 isodate==0.7.2
     # via streamlink
